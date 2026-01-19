@@ -1,7 +1,33 @@
 """
-Common argument parser helpers for quantum scripts.
+Standardized command-line argument parsing for quantum experiments.
 
-Provides standard argument groups for noise, backend, and execution parameters.
+This module provides reusable argument parser functions that enforce consistent
+command-line interfaces across all quantum algorithm scripts. Reduces boilerplate
+and ensures uniform parameter naming conventions.
+
+Function Categories:
+    Argument Groups:
+        - add_noise_args: Add T1/T2 relaxation and dephasing parameters
+        - add_backend_args: Add backend selection and coupling map options
+        - add_execution_args: Add shots and random seed parameters
+        - add_standard_quantum_args: Add all common quantum execution parameters
+
+Typical Usage:
+    import argparse
+    from q8020_args import add_standard_quantum_args
+    
+    parser = argparse.ArgumentParser(description="My quantum algorithm")
+    parser.add_argument("--molecule", required=True)
+    add_standard_quantum_args(parser, default_shots=8192)
+    
+    args = parser.parse_args()
+    # args.shots, args.backend, args.t1, args.t2, etc. are all available
+
+Standard Parameters:
+    Noise: --t1, --t2 (microseconds)
+    Backend: --backend (fake backend name), --coupling-map (default|all-to-all)
+    Execution: --shots, --seed
+    Transpilation: --optimization-level (0-3)
 """
 
 import argparse

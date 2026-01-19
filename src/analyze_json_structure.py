@@ -1,11 +1,45 @@
 """
-Analyze JSON structure across all experiment outputs.
+JSON output structure analyzer for quality assurance.
 
-Scans ~/qp4p directory to:
-1. Find all JSON files at UUID and case levels
-2. Build comprehensive dictionary of all field names
-3. Identify non-standardized outputs
+This diagnostic tool scans experiment output directories to validate that all
+scripts are producing standardized JSON output. It identifies structural
+inconsistencies, missing fields, and non-standard outputs across sweep runs.
+
+Analysis Categories:
+    File Discovery:
+        - Categorize JSON files by type (stdout, params, sweep_results, etc.)
+        - Count UUID run directories
+    
+    Structure Analysis:
+        - Extract all field names from stdout.json files
+        - Identify top-level structure patterns
+        - Calculate field frequency across experiments
+    
+    Quality Checks:
+        - Find files with non-standard structure
+        - Identify fields present in some but not all outputs
+        - Detect parse errors and empty files
+    
+    Parameter Analysis:
+        - Analyze params.json structure
+        - Track parameter name usage frequency
+
+Usage:
+    python analyze_json_structure.py ~/q8020
+    python analyze_json_structure.py  # defaults to ~/q8020
+
+Output:
+    - File categorization summary
+    - Comprehensive field dictionary with frequencies
+    - Top-level structure variations
+    - Standardization issues and recommendations
+    - Non-standard files requiring attention
+
+This tool is essential for maintaining output consistency across a growing
+codebase of quantum algorithm implementations.
 """
+
+#pylint: disable=broad-exception-caught
 
 import json
 from pathlib import Path
@@ -253,5 +287,5 @@ def analyze_json_files(base_dir):
 
 
 if __name__ == "__main__":
-    base_dir = sys.argv[1] if len(sys.argv) > 1 else "~/qp4p"
+    base_dir = sys.argv[1] if len(sys.argv) > 1 else "~/q8020"
     analyze_json_files(base_dir)

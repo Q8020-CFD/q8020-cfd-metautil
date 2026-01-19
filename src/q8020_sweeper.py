@@ -1,14 +1,53 @@
 """
-Generic sweep runner for executing scripts with parameters from TOML files.
+Parameter sweep orchestration for quantum experiments.
 
-Reads a TOML file, expands list parameters into individual cases,
-runs an executable for each case, and captures results to a directory.
+This module provides a generic framework for running parameter sweeps across quantum
+algorithms. It reads TOML configuration files, expands parameter combinations, executes
+scripts for each case, and organizes results in a structured directory hierarchy.
+
+Function Categories:
+    Configuration Management:
+        - load_sweep_config: Parse TOML files with global params and experiment groups
+        - expand_case_lists: Expand list-valued parameters into individual cases
+        - build_command_args: Convert parameter dicts to command-line arguments
+    
+    Execution:
+        - run_sweep: Main orchestrator - execute full parameter sweep
+        - run_postproc: Execute postprocessing scripts on sweep results
+    
+    Metadata:
+        - get_library_versions: Capture installed package versions for reproducibility
+
+Directory Structure:
+    <run_uuid>/
+        sweep_results.json          # Overall sweep metadata
+        expanded_cases.json         # All parameter combinations
+        <case_id>/
+            params.json             # Case-specific parameters
+            stdout.json             # Script output (standardized format)
+            *.png, *.pdf            # Generated visualizations
+
+TOML Configuration Format:
+    [global]
+    shots = 1024
+    backend = "manila"
+    
+    [group.my_experiment]
+    molecule = ["H2", "LiH"]
+    ancilla = [4, 6, 8]
+    _script = "src/my_algorithm.py"
+    _postproc = ["src/plot_results.py"]
+
+Usage:
+    python q8020_sweeper.py config.toml --group my_experiment
+    python q8020_sweeper.py config.toml --dry-run
 """
 
 #pylint: disable=broad-exception-caught
 
 import subprocess
 import json
+import os
 import shutil
 import sys
 import uuid
@@ -17,7 +56,7 @@ from pathlib import Path
 from datetime import datetime
 from itertools import product
 
-import tomli as tomllib
+import tomllib
 
 # ANSI color codes
 GREEN = '\033[92m'
@@ -223,7 +262,6 @@ def run_postproc(postproc_list: list, postproc_json: Path, script_dir: Path = No
     # Set up environment with PYTHONPATH
     env = None
     if script_dir:
-        import os
         env = os.environ.copy()
         existing_path = env.get('PYTHONPATH', '')
         if existing_path:
@@ -569,9 +607,9 @@ Example TOML:
     ancilla = [4, 6, 8]
 
 Usage:
-    python qp4p_sweeper.py src/gs_qpe.py input/gs_qpe.toml
-    python qp4p_sweeper.py src/gs_qpe.py input/gs_qpe.toml --dry-run
-    python qp4p_sweeper.py src/gs_qpe.py input/gs_qpe.toml --group size_study
+    python q8020_sweeper.py src/gs_qpe.py input/gs_qpe.toml
+    python q8020_sweeper.py src/gs_qpe.py input/gs_qpe.toml --dry-run
+    python q8020_sweeper.py src/gs_qpe.py input/gs_qpe.toml --group size_study
 """)
     parser.add_argument("toml_file", help="Path to TOML configuration file")
     parser.add_argument("script", nargs="?", default=None, 
@@ -587,9 +625,8 @@ Usage:
         # If script not provided as argument, try to read from TOML
         script = args.script
         if script is None:
-            import tomli as tomli_local
             with open(args.toml_file, "rb") as f:
-                toml_data = tomli_local.load(f)
+                toml_data = tomllib.load(f)
                 script = toml_data.get("global", {}).get("_script")
                 # Allow None - groups may specify their own _script
         

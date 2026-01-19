@@ -1,8 +1,66 @@
 """
-Standardized JSON output structure for quantum experiments.
+Standardized JSON output for quantum experiments.
 
-Provides utilities for creating consistent JSON output across all apps.
+This module enforces a consistent output schema across all quantum algorithm scripts,
+enabling automated analysis, visualization, and comparison of results. All outputs
+include metadata, configuration, results, and execution context.
+
+Function Categories:
+    Output Generation:
+        - create_standardized_output: Build complete output dict with all metadata
+        - output_json: Write standardized JSON to stdout or file
+        - output_error: Generate error output and exit with status 1
+    
+    Metadata Extraction:
+        - extract_circuit_stats: Extract depth, gate counts from circuits
+        - get_user_info: Capture username, hostname, working directory
+        - get_library_versions: Capture all installed package versions
+    
+    Utilities:
+        - normalize_param_name: Convert hyphenated names to underscores
+        - normalize_params: Normalize all keys in parameter dict
+
+Standard Output Schema:
+    {
+        "metadata": {
+            "algorithm": "vqe",
+            "script_name": "gs_vqe.py",
+            "timestamp": "2026-01-19T18:14:23.456789",
+            "execution_time_seconds": 45.2
+        },
+        "problem": {
+            "molecule": "H2",
+            "basis": "sto-3g"
+        },
+        "config": {
+            "shots": 1024,
+            "backend": "manila",
+            "optimization_level": 1
+        },
+        "results": {
+            "energy": -1.137,
+            "iterations": 42
+        },
+        "circuit_stats": {...},
+        "backend_info": {...},
+        "library_versions": {...},
+        "user_info": {...}
+    }
+
+Usage:
+    from q8020_output import output_json
+    
+    output_json(
+        algorithm="vqe",
+        problem={"molecule": "H2"},
+        config={"shots": 1024},
+        results={"energy": -1.137},
+        original_circuit=qc,
+        transpiled_circuit=qc_transpiled
+    )
 """
+
+#pylint: disable=broad-exception-caught
 
 import json
 import sys

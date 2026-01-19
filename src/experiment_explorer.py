@@ -142,7 +142,7 @@ def main():
         st.header("Data Source")
         data_dir = st.text_input(
             "Sweep output directory",
-            value="~/qp4p",
+            value="~/q8020",
             help="Directory containing sweep run outputs"
         )
         

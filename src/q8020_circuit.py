@@ -1,18 +1,47 @@
 """
-Helper functions for running quantum circuits.
+Quantum circuit execution and backend management utilities.
+
+This module provides a comprehensive interface for running quantum circuits with
+Qiskit, including backend configuration, noise modeling, transpilation, and execution.
+
+Function Categories:
+    Backend Management:
+        - get_fake_backend: Retrieve IBM fake backend instances by name
+        - get_backend_info: Extract detailed backend properties and error rates
+    
+    Noise Modeling:
+        - build_noise_model: Construct noise models from T1/T2 or fake backends
+    
+    Circuit Execution:
+        - transpile_circuit: Transpile circuits with noise and coupling constraints
+        - execute_circuit: Execute transpiled circuits with noise simulation
+        - run_circuit: High-level circuit execution (transpile + execute)
+        - run_estimator: Execute circuits with observables using EstimatorV2
+        - run_circuit_display: Execute and optionally display circuit visualizations
+    
+    Utilities:
+        - estimate_shots: Calculate required shots for target error bounds
+
+Typical Usage:
+    from q8020_circuit import run_circuit, build_noise_model
+    
+    # Simple execution
+    result = run_circuit(qc, shots=1024, backend='manila')
+    
+    # With noise model
+    noise_model, backend, coupling = build_noise_model(t1=50, t2=70, backend='jakarta')
+    result = execute_circuit(qc_transpiled, backend, noise_model, shots=8192)
 """
 import math
-import json
+import time
 import numpy as np
 from qiskit import QuantumCircuit, transpile
 from qiskit.visualization import plot_histogram, plot_bloch_multivector
 from qiskit.quantum_info import Statevector
+from qiskit.transpiler import CouplingMap
 from qiskit_aer import AerSimulator
 from qiskit_aer.noise import NoiseModel, thermal_relaxation_error
-from qiskit.primitives import StatevectorEstimator
 from qiskit_aer.primitives import EstimatorV2
-from qiskit.transpiler.preset_passmanagers import generate_preset_pass_manager
-from qiskit.transpiler import CouplingMap
 from qiskit_ibm_runtime import fake_provider
 import matplotlib.pyplot as plt
 
@@ -228,7 +257,6 @@ def transpile_circuit(qc: QuantumCircuit, args=None, t1: float = None, t2: float
             noise_model: The noise model (if any)
             backend_info: Backend details dict (includes transpile_time)
     """
-    import time
     
     # Extract from args if provided
     if args is not None:
@@ -306,9 +334,7 @@ def execute_circuit(qc_transpiled: QuantumCircuit, backend, noise_model=None,
     
     Returns:
         Dict with counts and execution timing.
-    """
-    import time
-    
+    """    
     # Extract from args if provided
     if args is not None:
         shots = getattr(args, 'shots', shots)
@@ -469,7 +495,7 @@ def run_circuit_display(circ: QuantumCircuit, args=None, t1: float = None, t2: f
     # Only show graphical display if requested
     if display:
         # Create main figure with circuit and histogram
-        fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+        _, axes = plt.subplots(1, 2, figsize=(12, 4))
         circ.draw("mpl", ax=axes[0])
         plot_histogram(exec_result["counts"], ax=axes[1])
         plt.tight_layout()
