@@ -19,6 +19,9 @@ dependencies = [
     "plotly"
 ]
 
+[tool.setuptools.packages.find]
+where = ["src"]
+
 [tool.pylint.messages_control]
 disable = [
     "C0103",  # invalid-name
