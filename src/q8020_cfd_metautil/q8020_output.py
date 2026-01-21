@@ -66,7 +66,7 @@ import json
 import sys
 import importlib.metadata
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Union, List
 import platform
 import inspect
 import os
@@ -174,7 +174,7 @@ def create_standardized_output(
     script_name: Optional[str] = None,
     results: Optional[dict] = None,
     metrics: Optional[dict] = None,
-    circuit_info: Optional[dict] = None,
+    circuit_info: Optional[Union[dict, List[dict]]] = None,
     backend_info: Optional[dict] = None,
     visualization_data: Optional[dict] = None,
     error: Optional[str] = None,
@@ -194,7 +194,10 @@ def create_standardized_output(
         script_name: Optional script filename (auto-detected if not provided)
         results: Optional algorithm results dictionary (for additional custom results)
         metrics: Optional performance metrics (fidelity, error, etc.)
-        circuit_info: Optional circuit statistics
+        circuit_info: Optional circuit statistics. Can be:
+            - A single dict for one circuit: {"num_qubits": 5, "depth": 10, ...}
+            - A list of dicts for multiple circuits, each with optional "label":
+              [{"label": "state_prep", "num_qubits": 4, ...}, {"label": "measure", ...}]
         backend_info: Optional backend information
         visualization_data: Optional visualization data
         error: Optional error message if execution failed
@@ -312,7 +315,7 @@ def output_json(
     script_name: Optional[str] = None,
     results: Optional[dict] = None,
     metrics: Optional[dict] = None,
-    circuit_info: Optional[dict] = None,
+    circuit_info: Optional[Union[dict, List[dict]]] = None,
     backend_info: Optional[dict] = None,
     visualization_data: Optional[dict] = None,
     error: Optional[str] = None,
@@ -334,7 +337,7 @@ def output_json(
         script_name: Optional script filename (auto-detected if not provided)
         results: Optional algorithm results dictionary (for additional custom results)
         metrics: Optional performance metrics (fidelity, error, etc.)
-        circuit_info: Optional circuit statistics
+        circuit_info: Optional circuit statistics (dict or list of dicts for multiple circuits)
         backend_info: Optional backend information
         visualization_data: Optional visualization data
         error: Optional error message if execution failed
