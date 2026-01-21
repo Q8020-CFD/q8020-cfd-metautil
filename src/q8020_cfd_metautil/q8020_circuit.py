@@ -96,19 +96,40 @@ def get_fake_backend(name: str):
         ) from e
 
 
-def get_backend_info(backend) -> dict:
+def get_backend_info(backend=None, t1_us: float = None, t2_us: float = None,
+                     coupling_map=None, coupling_map_name: str = None) -> dict:
     """
-    Extract detailed information from a backend.
+    Extract detailed information from a backend or build synthetic backend info.
     
     Args:
-        backend: A Qiskit backend instance.
+        backend: A Qiskit backend instance (optional).
+        t1_us: T1 relaxation time in microseconds for synthetic backend (optional).
+        t2_us: T2 dephasing time in microseconds for synthetic backend (optional).
+        coupling_map: CouplingMap object for synthetic backend (optional).
+        coupling_map_name: Name of coupling map (e.g., "all-to-all", "default") (optional).
     
     Returns:
         Dict with backend details: name, num_qubits, basis_gates, coupling_map, 
-        and per-qubit error statistics.
+        and per-qubit error statistics. Returns None if no backend and no t1/t2.
     """
-    if backend is None:
+    # If no backend and no noise params, return None
+    if backend is None and t1_us is None and t2_us is None:
         return None
+    
+    # Build synthetic backend info if no real backend but t1/t2 provided
+    if backend is None:
+        info = {
+            "name": "synthetic_noise_model",
+            "type": "synthetic",
+            "t1_us": t1_us,
+            "t2_us": t2_us,
+        }
+        if coupling_map is not None:
+            info["coupling_map"] = list(coupling_map.get_edges())
+            info["num_qubits"] = coupling_map.size()
+        if coupling_map_name:
+            info["coupling_map_type"] = coupling_map_name
+        return info
     
     info = {
         "name": backend.name,
