@@ -16,8 +16,12 @@ dependencies = [
     "numpy",
     "duckdb",
     "streamlit",
-    "plotly"
+    "plotly",
+    "watchdog"
 ]
+
+[project.scripts]
+q8020-run = "q8020_cfd_metautil.q8020_run:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

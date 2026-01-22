@@ -1,0 +1,1 @@
+streamlit run src/q8020_cfd_metautil/experiment_explorer.py

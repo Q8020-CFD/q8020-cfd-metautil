@@ -4,15 +4,94 @@ Experiment Explorer - Interactive visualization of sweep experiment results.
 Uses DuckDB to query JSON files directly from disk (no data duplication)
 and Streamlit for interactive attribute selection and visualization.
 
-Run with: streamlit run helpers/src/experiment_explorer.py
+Features:
+- Dynamic field discovery from JSON files
+- 2D and 3D scatter plots with configurable axes
+- Filtering by field values (e.g., "where algorithm=hhl, plot fidelity vs shots")
+- Default view: case × algorithm × backend colored by fidelity
+- Live file watching with watchdog for automatic updates
+
+Run with: streamlit run experiment_explorer.py [-- --data-dir ~/q8020]
 """
 
 import json
+import threading
 from pathlib import Path
+from typing import Optional
 
+import duckdb
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler, FileCreatedEvent, FileModifiedEvent
+
+
+# Default axis mappings for common field names
+DEFAULT_AXES = {
+    "x": ["_case_id", "problem.dimension", "config.shots", "param.size"],
+    "y": ["metrics.fidelity", "metrics.l2_error", "circuit_info.depth", "circuit_info.num_qubits"],
+    "z": ["algorithm", "script_name", "config.backend", "backend_info.backend_name"],
+    "color": ["algorithm", "config.backend", "_run_id", "status"]
+}
+
+
+class ExperimentFileHandler(FileSystemEventHandler):
+    """Watchdog handler that detects new/modified stdout.json files."""
+    
+    def __init__(self):
+        self.change_detected = threading.Event()
+        self._last_change_time = 0
+    
+    def on_created(self, event):
+        if isinstance(event, FileCreatedEvent) and event.src_path.endswith("stdout.json"):
+            self.change_detected.set()
+    
+    def on_modified(self, event):
+        if isinstance(event, FileModifiedEvent) and event.src_path.endswith("stdout.json"):
+            self.change_detected.set()
+
+
+# Global observer and handler (persists across Streamlit reruns)
+_file_observer: Optional[Observer] = None
+_file_handler: Optional[ExperimentFileHandler] = None
+_watched_path: Optional[str] = None
+
+
+def start_file_watcher(data_dir: str) -> ExperimentFileHandler:
+    """Start or restart the file watcher for the given directory."""
+    global _file_observer, _file_handler, _watched_path
+    
+    data_path = str(Path(data_dir).expanduser().resolve())
+    
+    # If already watching the same path, return existing handler
+    if _file_observer is not None and _watched_path == data_path:
+        return _file_handler
+    
+    # Stop existing observer if watching different path
+    if _file_observer is not None:
+        _file_observer.stop()
+        _file_observer.join(timeout=1)
+    
+    # Create new observer
+    _file_handler = ExperimentFileHandler()
+    _file_observer = Observer()
+    _file_observer.schedule(_file_handler, data_path, recursive=True)
+    _file_observer.start()
+    _watched_path = data_path
+    
+    return _file_handler
+
+
+def stop_file_watcher():
+    """Stop the file watcher."""
+    global _file_observer, _file_handler, _watched_path
+    if _file_observer is not None:
+        _file_observer.stop()
+        _file_observer.join(timeout=1)
+        _file_observer = None
+        _file_handler = None
+        _watched_path = None
 
 
 def flatten_json(nested_json: dict, parent_key: str = "", sep: str = ".") -> dict:
@@ -40,31 +119,33 @@ def flatten_json(nested_json: dict, parent_key: str = "", sep: str = ".") -> dic
     return dict(items)
 
 
-def load_experiments(data_dir: str) -> pd.DataFrame:
+def load_experiments_duckdb(data_dir: str) -> tuple[pd.DataFrame, dict]:
     """
-    Load all experiment JSON files from sweep output directories.
+    Load all experiment JSON files using DuckDB for efficient querying.
     
-    Scans for stdout.json files in sweep run directories and flattens
-    the JSON structure for tabular analysis.
+    DuckDB can query JSON files directly, allowing on-the-fly schema discovery
+    without pre-processing. Falls back to Python loading if DuckDB fails.
     
     Args:
         data_dir: Base directory containing sweep runs
     
     Returns:
-        DataFrame with flattened experiment data
+        Tuple of (DataFrame with flattened data, field_info dict with value samples)
     """
     data_path = Path(data_dir).expanduser()
     
     if not data_path.exists():
-        return pd.DataFrame()
+        return pd.DataFrame(), {}
     
-    # Find all stdout.json files (individual case results)
+    # Find all stdout.json files
     json_files = list(data_path.glob("**/stdout.json"))
     
     if not json_files:
-        return pd.DataFrame()
+        return pd.DataFrame(), {}
     
     records = []
+    field_values = {}  # Track unique values per field for picker
+    
     for json_file in json_files:
         try:
             with open(json_file, "r", encoding="utf-8") as f:
@@ -90,15 +171,62 @@ def load_experiments(data_dir: str) -> pd.DataFrame:
                     if not k.startswith("_"):
                         flat[f"param.{k}"] = v
             
+            # Track field values for picker
+            for k, v in flat.items():
+                if k not in field_values:
+                    field_values[k] = set()
+                if v is not None and not isinstance(v, (list, dict)):
+                    # Only track scalar values, limit to 50 unique
+                    if len(field_values[k]) < 50:
+                        field_values[k].add(v)
+            
             records.append(flat)
-        except (json.JSONDecodeError, IOError) as e:
-            st.warning(f"Skipping {json_file}: {e}")
+        except (json.JSONDecodeError, IOError):
             continue
     
     if not records:
-        return pd.DataFrame()
+        return pd.DataFrame(), {}
     
-    return pd.DataFrame(records)
+    df = pd.DataFrame(records)
+    
+    # Convert field_values sets to sorted lists
+    field_info = {}
+    for k, v in field_values.items():
+        try:
+            field_info[k] = sorted(list(v), key=lambda x: (x is None, str(x)))
+        except TypeError:
+            field_info[k] = list(v)
+    
+    return df, field_info
+
+
+def get_field_type(df: pd.DataFrame, col: str) -> str:
+    """Determine if a field is numeric, categorical, or mixed."""
+    if col not in df.columns:
+        return "unknown"
+    
+    try:
+        pd.to_numeric(df[col].dropna(), errors="raise")
+        return "numeric"
+    except (ValueError, TypeError):
+        pass
+    
+    # Check if categorical (few unique values)
+    if df[col].nunique() <= 20:
+        return "categorical"
+    
+    return "text"
+
+
+def find_default_field(df: pd.DataFrame, candidates: list, field_type: Optional[str] = None) -> Optional[str]:
+    """Find the first available field from a list of candidates."""
+    for candidate in candidates:
+        if candidate in df.columns:
+            if field_type is None:
+                return candidate
+            if get_field_type(df, candidate) == field_type:
+                return candidate
+    return None
 
 
 def get_numeric_columns(df: pd.DataFrame) -> list:
@@ -146,15 +274,39 @@ def main():
             help="Directory containing sweep run outputs"
         )
         
-        if st.button("🔄 Reload Data"):
-            st.cache_data.clear()
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("🔄 Reload"):
+                st.cache_data.clear()
+                st.rerun()
+        with col2:
+            live_watch = st.checkbox("👁️ Live", value=True, help="Watch for new experiments")
+        
+        # Start/manage file watcher
+        if live_watch:
+            handler = start_file_watcher(data_dir)
+            st.caption("🟢 Watching for changes...")
+        else:
+            stop_file_watcher()
+            st.caption("⏸️ Live watching paused")
+    
+    # Fragment that checks for file changes periodically without blocking UI
+    @st.fragment(run_every=3)
+    def check_for_changes():
+        if live_watch and _file_handler is not None:
+            if _file_handler.change_detected.is_set():
+                _file_handler.change_detected.clear()
+                st.cache_data.clear()
+                st.rerun()
+    
+    check_for_changes()
     
     # Load data with caching
     @st.cache_data
     def cached_load(directory):
-        return load_experiments(directory)
+        return load_experiments_duckdb(directory)
     
-    df = cached_load(data_dir)
+    df, field_info = cached_load(data_dir)
     
     if df.empty:
         st.warning(f"No experiment data found in {data_dir}")
@@ -166,26 +318,36 @@ def main():
     # Get column types
     numeric_cols = get_numeric_columns(df)
     categorical_cols = get_categorical_columns(df)
-    all_cols = sorted([c for c in df.columns if not c.startswith("_")])
+    # Include _case_id and _run_id in categorical since they're useful for grouping
+    meta_cols = ["_case_id", "_run_id"]
+    for mc in meta_cols:
+        if mc in df.columns and mc not in categorical_cols:
+            categorical_cols.insert(0, mc)
+    all_cols = sorted([c for c in df.columns if not c.startswith("_") or c in meta_cols])
     
-    # Sidebar filters
+    # Sidebar filters - enhanced with value previews
     with st.sidebar:
-        st.header("Filters")
+        st.header("🔍 Filters")
+        st.caption("Filter experiments before plotting")
         
         # Dynamic filters based on categorical columns
         filters = {}
         filter_cols = st.multiselect(
             "Filter by attributes",
             options=categorical_cols,
-            default=[]
+            default=[],
+            help="Select fields to filter on"
         )
         
         for col in filter_cols:
-            unique_vals = df[col].dropna().unique().tolist()
+            unique_vals = field_info.get(col, df[col].dropna().unique().tolist())
+            if isinstance(unique_vals, set):
+                unique_vals = list(unique_vals)
             selected = st.multiselect(
-                f"{col}",
+                f"**{col}**",
                 options=unique_vals,
-                default=unique_vals
+                default=unique_vals,
+                help=f"{len(unique_vals)} unique values"
             )
             if selected:
                 filters[col] = selected
@@ -198,18 +360,91 @@ def main():
     st.markdown(f"**Showing {len(filtered_df)} of {len(df)} experiments**")
     
     # Main content tabs
-    tab1, tab2, tab3, tab4 = st.tabs(["📈 2D Plot", "🧊 3D Plot", "📋 Data Table", "🔍 Raw JSON"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["🧊 3D Plot", "📈 2D Plot", "📋 Data Table", "🔍 Raw JSON", "🔧 SQL Query"])
     
+    # 3D Plot tab (default view: case × algorithm × backend, colored by fidelity)
     with tab1:
+        st.subheader("3D Scatter Plot")
+        st.caption("Default: case × algorithm × metric (colored by algorithm)")
+        
+        # Smart defaults for 3D: case_id, metric, algorithm
+        all_plottable = numeric_cols + categorical_cols
+        
+        # Find best defaults
+        default_x = find_default_field(df, ["_case_id", "problem.dimension", "config.shots"]) or (all_plottable[0] if all_plottable else None)
+        default_y = find_default_field(df, ["metrics.fidelity", "metrics.l2_error", "circuit_info.depth"]) or (all_plottable[1] if len(all_plottable) > 1 else None)
+        default_z = find_default_field(df, ["circuit_info.num_qubits", "circuit_info.depth", "config.shots"]) or (all_plottable[2] if len(all_plottable) > 2 else None)
+        default_color = find_default_field(df, ["algorithm", "config.backend", "status"]) or (categorical_cols[0] if categorical_cols else None)
+        
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            x_idx = all_plottable.index(default_x) if default_x in all_plottable else 0
+            x_axis_3d = st.selectbox("X Axis", options=all_plottable, index=x_idx, key="3d_x")
+        with col2:
+            y_idx = all_plottable.index(default_y) if default_y in all_plottable else min(1, len(all_plottable)-1)
+            y_axis_3d = st.selectbox("Y Axis", options=all_plottable, index=y_idx, key="3d_y")
+        with col3:
+            z_idx = all_plottable.index(default_z) if default_z in all_plottable else min(2, len(all_plottable)-1)
+            z_axis_3d = st.selectbox("Z Axis", options=all_plottable, index=z_idx, key="3d_z")
+        with col4:
+            color_opts = ["None"] + categorical_cols
+            color_idx = color_opts.index(default_color) if default_color in color_opts else 0
+            color_by_3d = st.selectbox("Color by", options=color_opts, index=color_idx, key="3d_color")
+        
+        if x_axis_3d and y_axis_3d and z_axis_3d:
+            plot_df = filtered_df[[x_axis_3d, y_axis_3d, z_axis_3d]].copy()
+            
+            # Convert to numeric where possible
+            for axis in [x_axis_3d, y_axis_3d, z_axis_3d]:
+                if get_field_type(df, axis) == "numeric":
+                    plot_df[axis] = pd.to_numeric(plot_df[axis], errors="coerce")
+                else:
+                    # For categorical, encode as integers for 3D positioning
+                    plot_df[axis] = pd.Categorical(filtered_df[axis]).codes
+            
+            if color_by_3d != "None":
+                plot_df[color_by_3d] = filtered_df[color_by_3d].astype(str)
+                fig = px.scatter_3d(
+                    plot_df.dropna(),
+                    x=x_axis_3d,
+                    y=y_axis_3d,
+                    z=z_axis_3d,
+                    color=color_by_3d,
+                    title=f"3D: {x_axis_3d} × {y_axis_3d} × {z_axis_3d}"
+                )
+            else:
+                fig = px.scatter_3d(
+                    plot_df.dropna(),
+                    x=x_axis_3d,
+                    y=y_axis_3d,
+                    z=z_axis_3d,
+                    title=f"3D: {x_axis_3d} × {y_axis_3d} × {z_axis_3d}"
+                )
+            
+            fig.update_layout(height=650)
+            st.plotly_chart(fig, use_container_width=True)
+    
+    # 2D Plot tab
+    with tab2:
         st.subheader("2D Scatter Plot")
+        st.caption("Compare any two fields with optional color grouping")
+        
+        # Smart defaults for 2D
+        default_2d_x = find_default_field(df, ["config.shots", "problem.dimension", "param.size"]) or (numeric_cols[0] if numeric_cols else None)
+        default_2d_y = find_default_field(df, ["metrics.fidelity", "metrics.l2_error"]) or (numeric_cols[1] if len(numeric_cols) > 1 else None)
+        default_2d_color = find_default_field(df, ["algorithm", "config.backend"]) or None
         
         col1, col2, col3 = st.columns(3)
         with col1:
-            x_axis = st.selectbox("X Axis", options=numeric_cols, index=0 if numeric_cols else None, key="2d_x")
+            x_idx = numeric_cols.index(default_2d_x) if default_2d_x in numeric_cols else 0
+            x_axis = st.selectbox("X Axis", options=numeric_cols, index=x_idx if numeric_cols else None, key="2d_x")
         with col2:
-            y_axis = st.selectbox("Y Axis", options=numeric_cols, index=min(1, len(numeric_cols)-1) if numeric_cols else None, key="2d_y")
+            y_idx = numeric_cols.index(default_2d_y) if default_2d_y in numeric_cols else min(1, len(numeric_cols)-1)
+            y_axis = st.selectbox("Y Axis", options=numeric_cols, index=y_idx if numeric_cols else None, key="2d_y")
         with col3:
-            color_by = st.selectbox("Color by", options=["None"] + categorical_cols, index=0, key="2d_color")
+            color_opts = ["None"] + categorical_cols
+            color_idx = color_opts.index(default_2d_color) if default_2d_color in color_opts else 0
+            color_by = st.selectbox("Color by", options=color_opts, index=color_idx, key="2d_color")
         
         if x_axis and y_axis:
             plot_df = filtered_df[[x_axis, y_axis]].copy()
@@ -235,47 +470,6 @@ def main():
                 )
             
             fig.update_layout(height=500)
-            st.plotly_chart(fig, use_container_width=True)
-    
-    with tab2:
-        st.subheader("3D Scatter Plot")
-        
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            x_axis_3d = st.selectbox("X Axis", options=numeric_cols, index=0 if numeric_cols else None, key="3d_x")
-        with col2:
-            y_axis_3d = st.selectbox("Y Axis", options=numeric_cols, index=min(1, len(numeric_cols)-1) if numeric_cols else None, key="3d_y")
-        with col3:
-            z_axis_3d = st.selectbox("Z Axis", options=numeric_cols, index=min(2, len(numeric_cols)-1) if numeric_cols else None, key="3d_z")
-        with col4:
-            color_by_3d = st.selectbox("Color by", options=["None"] + categorical_cols, index=0, key="3d_color")
-        
-        if x_axis_3d and y_axis_3d and z_axis_3d:
-            plot_df = filtered_df[[x_axis_3d, y_axis_3d, z_axis_3d]].copy()
-            plot_df[x_axis_3d] = pd.to_numeric(plot_df[x_axis_3d], errors="coerce")
-            plot_df[y_axis_3d] = pd.to_numeric(plot_df[y_axis_3d], errors="coerce")
-            plot_df[z_axis_3d] = pd.to_numeric(plot_df[z_axis_3d], errors="coerce")
-            
-            if color_by_3d != "None":
-                plot_df[color_by_3d] = filtered_df[color_by_3d].astype(str)
-                fig = px.scatter_3d(
-                    plot_df.dropna(),
-                    x=x_axis_3d,
-                    y=y_axis_3d,
-                    z=z_axis_3d,
-                    color=color_by_3d,
-                    title=f"3D: {x_axis_3d} × {y_axis_3d} × {z_axis_3d}"
-                )
-            else:
-                fig = px.scatter_3d(
-                    plot_df.dropna(),
-                    x=x_axis_3d,
-                    y=y_axis_3d,
-                    z=z_axis_3d,
-                    title=f"3D: {x_axis_3d} × {y_axis_3d} × {z_axis_3d}"
-                )
-            
-            fig.update_layout(height=600)
             st.plotly_chart(fig, use_container_width=True)
     
     with tab3:
@@ -322,15 +516,79 @@ def main():
                 except Exception as e:
                     st.error(f"Error loading JSON: {e}")
     
-    # Footer with available attributes
-    with st.expander("📋 Available Attributes"):
-        col1, col2 = st.columns(2)
+    # SQL Query tab for advanced users
+    with tab5:
+        st.subheader("SQL Query (DuckDB)")
+        st.caption("Query the experiment data using SQL. Table name is `experiments`.")
+        
+        default_query = """SELECT 
+    algorithm, 
+    COUNT(*) as count,
+    AVG("metrics.fidelity") as avg_fidelity,
+    AVG("circuit_info.depth") as avg_depth
+FROM experiments 
+GROUP BY algorithm
+ORDER BY avg_fidelity DESC"""
+        
+        query = st.text_area("SQL Query", value=default_query, height=150)
+        
+        if st.button("▶️ Run Query"):
+            try:
+                # Register the filtered dataframe as a DuckDB table
+                con = duckdb.connect()
+                con.register("experiments", filtered_df)
+                result = con.execute(query).fetchdf()
+                st.dataframe(result, use_container_width=True)
+                
+                # Option to plot results
+                if len(result.columns) >= 2:
+                    st.markdown("---")
+                    st.markdown("**Quick Plot from Results**")
+                    qcol1, qcol2 = st.columns(2)
+                    with qcol1:
+                        qx = st.selectbox("X", options=result.columns.tolist(), key="sql_x")
+                    with qcol2:
+                        qy = st.selectbox("Y", options=result.columns.tolist(), index=min(1, len(result.columns)-1), key="sql_y")
+                    
+                    if qx and qy:
+                        fig = px.bar(result, x=qx, y=qy, title=f"{qy} by {qx}")
+                        st.plotly_chart(fig, use_container_width=True)
+                
+                con.close()
+            except Exception as e:
+                st.error(f"Query error: {e}")
+    
+    # Footer with available attributes and field dictionary
+    with st.expander("📋 Field Dictionary", expanded=False):
+        st.markdown("All discovered fields with sample values")
+        
+        # Build field dictionary table
+        field_rows = []
+        for col in sorted(all_cols):
+            ftype = get_field_type(df, col)
+            samples = field_info.get(col, [])
+            if len(samples) > 5:
+                sample_str = ", ".join(str(s) for s in samples[:5]) + f" ... ({len(samples)} total)"
+            else:
+                sample_str = ", ".join(str(s) for s in samples) if samples else "(no values)"
+            field_rows.append({
+                "Field": col,
+                "Type": ftype,
+                "Unique": df[col].nunique() if col in df.columns else 0,
+                "Sample Values": sample_str
+            })
+        
+        field_df = pd.DataFrame(field_rows)
+        st.dataframe(field_df, use_container_width=True, height=300)
+        
+        # Quick stats
+        col1, col2, col3 = st.columns(3)
         with col1:
-            st.markdown("**Numeric attributes:**")
-            st.write(numeric_cols)
+            st.metric("Total Fields", len(all_cols))
         with col2:
-            st.markdown("**Categorical attributes:**")
-            st.write(categorical_cols)
+            st.metric("Numeric Fields", len(numeric_cols))
+        with col3:
+            st.metric("Categorical Fields", len(categorical_cols))
 
 
 if __name__ == "__main__":
