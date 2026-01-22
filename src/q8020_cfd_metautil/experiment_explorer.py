@@ -268,8 +268,12 @@ def get_field_type(df: pd.DataFrame, col: str) -> str:
         pass
     
     # Check if categorical (few unique values)
-    if df[col].nunique() <= 20:
-        return "categorical"
+    try:
+        if df[col].nunique() <= 20:
+            return "categorical"
+    except TypeError:
+        # Column contains unhashable types (lists, dicts)
+        return "text"
     
     return "text"
 
@@ -729,10 +733,15 @@ ORDER BY avg_fidelity DESC"""
                 sample_str = ", ".join(str(s) for s in samples[:5]) + f" ... ({len(samples)} total)"
             else:
                 sample_str = ", ".join(str(s) for s in samples) if samples else "(no values)"
+            # Handle unhashable types (lists, dicts) when counting unique values
+            try:
+                unique_count = df[col].nunique() if col in df.columns else 0
+            except TypeError:
+                unique_count = "N/A"
             field_rows.append({
                 "Field": col,
                 "Type": ftype,
-                "Unique": df[col].nunique() if col in df.columns else 0,
+                "Unique": unique_count,
                 "Sample Values": sample_str
             })
         
