@@ -10,8 +10,21 @@ Features:
 - Filtering by field values (e.g., "where algorithm=hhl, plot fidelity vs shots")
 - Default view: case × algorithm × backend colored by fidelity
 - Live file watching with watchdog for automatic updates
+- URL query parameters for pre-configured views
 
-Run with: streamlit run experiment_explorer.py [-- --data-dir ~/q8020]
+Run with: 
+    streamlit run experiment_explorer.py [-- --data-dir ~/q8020]
+
+URL Query Parameters (for pre-configured views):
+    ?x=config.ansatz_reps&y=metrics.fidelity&color=_case_id&preset=reps
+    
+    Supported parameters:
+    - data_dir: Data directory path
+    - x, y, z: Axis field names
+    - color: Color-by field name
+    - filter: Filter expression (field:value or field:~contains)
+    - preset: Named preset (reps, peclet, maxiter, matrix, overview)
+    - tab: Initial tab (2d, 3d, table, json, sql)
 """
 
 import json
@@ -33,6 +46,49 @@ DEFAULT_AXES = {
     "y": ["metrics.fidelity", "metrics.l2_error", "circuit_info.depth", "circuit_info.num_qubits"],
     "z": ["algorithm", "script_name", "config.backend", "backend_info.backend_name"],
     "color": ["algorithm", "config.backend", "_run_id", "status"]
+}
+
+# Named presets for common visualizations
+PRESETS = {
+    "reps": {
+        "x": "config.ansatz_reps",
+        "y": "metrics.fidelity",
+        "color": "_case_id",
+        "filter": "_case_id:~reps_",
+        "tab": "2d",
+        "title": "Ansatz Depth Study"
+    },
+    "peclet": {
+        "x": "config.peclet",
+        "y": "metrics.fidelity",
+        "color": "_case_id",
+        "filter": "_case_id:~peclet_",
+        "tab": "2d",
+        "title": "Peclet Number Study"
+    },
+    "maxiter": {
+        "x": "config.maxiter",
+        "y": "metrics.optimization_cost",
+        "color": "_case_id",
+        "filter": "_case_id:~maxiter_",
+        "tab": "2d",
+        "title": "Optimizer Iterations Study"
+    },
+    "matrix": {
+        "x": "_case_id",
+        "y": "metrics.fidelity",
+        "color": "_case_id",
+        "filter": "_case_id:~matrix_",
+        "tab": "2d",
+        "title": "Matrix Type Comparison"
+    },
+    "overview": {
+        "x": "_case_id",
+        "y": "metrics.fidelity",
+        "color": "algorithm",
+        "tab": "2d",
+        "title": "Overview - All Cases"
+    }
 }
 
 
@@ -255,6 +311,70 @@ def get_categorical_columns(df: pd.DataFrame) -> list:
     return sorted(cat_cols)
 
 
+def get_url_config() -> dict:
+    """
+    Get configuration from URL query parameters.
+    
+    Supports:
+    - preset: Named preset from PRESETS dict
+    - x, y, z: Axis field names
+    - color: Color-by field
+    - filter: Filter expression (field:value or field:~contains)
+    - tab: Initial tab (2d, 3d, table, json, sql)
+    - data_dir: Data directory override
+    
+    Returns:
+        Dict with configuration values (empty dict if no params)
+    """
+    params = st.query_params
+    config = {}
+    
+    # Check for preset first
+    preset_name = params.get("preset")
+    if preset_name and preset_name in PRESETS:
+        config.update(PRESETS[preset_name])
+        config["_preset_name"] = preset_name
+    
+    # Override with explicit params
+    for key in ["x", "y", "z", "color", "filter", "tab", "data_dir"]:
+        if key in params:
+            config[key] = params[key]
+    
+    return config
+
+
+def apply_filter_expression(df: pd.DataFrame, filter_expr: str) -> pd.DataFrame:
+    """
+    Apply a filter expression to the dataframe.
+    
+    Formats:
+    - field:value - exact match
+    - field:~pattern - contains pattern
+    
+    Args:
+        df: Input dataframe
+        filter_expr: Filter expression string
+    
+    Returns:
+        Filtered dataframe
+    """
+    if ":" not in filter_expr:
+        return df
+    
+    field, value = filter_expr.split(":", 1)
+    
+    if field not in df.columns:
+        return df
+    
+    if value.startswith("~"):
+        # Contains filter
+        pattern = value[1:]
+        return df[df[field].astype(str).str.contains(pattern, case=False, na=False)]
+    else:
+        # Exact match
+        return df[df[field].astype(str) == value]
+
+
 def main():
     st.set_page_config(
         page_title="Experiment Explorer",
@@ -262,15 +382,26 @@ def main():
         layout="wide"
     )
     
+    # Get URL configuration
+    url_config = get_url_config()
+    
     st.title("📊 Experiment Explorer")
-    st.markdown("Interactive visualization of quantum algorithm sweep results")
+    
+    # Show preset info if loaded from URL
+    if "_preset_name" in url_config:
+        st.markdown(f"**Preset: {url_config.get('title', url_config['_preset_name'])}**")
+    else:
+        st.markdown("Interactive visualization of quantum algorithm sweep results")
     
     # Sidebar for configuration
     with st.sidebar:
         st.header("Data Source")
+        
+        # Use URL param or default
+        default_data_dir = url_config.get("data_dir", "~/q8020")
         data_dir = st.text_input(
             "Sweep output directory",
-            value="~/q8020",
+            value=default_data_dir,
             help="Directory containing sweep run outputs"
         )
         
@@ -354,6 +485,14 @@ def main():
     
     # Apply filters
     filtered_df = df.copy()
+    
+    # Apply URL filter expression first
+    url_filter = url_config.get("filter")
+    if url_filter:
+        filtered_df = apply_filter_expression(filtered_df, url_filter)
+        st.sidebar.caption(f"🔗 URL filter: `{url_filter}`")
+    
+    # Apply interactive filters
     for col, values in filters.items():
         filtered_df = filtered_df[filtered_df[col].isin(values)]
     
@@ -429,18 +568,37 @@ def main():
         st.subheader("2D Scatter Plot")
         st.caption("Compare any two fields with optional color grouping")
         
-        # Smart defaults for 2D
-        default_2d_x = find_default_field(df, ["config.shots", "problem.dimension", "param.size"]) or (numeric_cols[0] if numeric_cols else None)
-        default_2d_y = find_default_field(df, ["metrics.fidelity", "metrics.l2_error"]) or (numeric_cols[1] if len(numeric_cols) > 1 else None)
-        default_2d_color = find_default_field(df, ["algorithm", "config.backend"]) or None
+        # Use URL config for defaults if provided, otherwise use smart defaults
+        # Include categorical cols for x-axis (useful for case_id plots)
+        all_2d_cols = numeric_cols + [c for c in categorical_cols if c not in numeric_cols]
+        
+        # Get defaults from URL config or fall back to smart defaults
+        url_x = url_config.get("x")
+        url_y = url_config.get("y")
+        url_color = url_config.get("color")
+        
+        if url_x and url_x in all_2d_cols:
+            default_2d_x = url_x
+        else:
+            default_2d_x = find_default_field(df, ["config.shots", "problem.dimension", "param.size"]) or (all_2d_cols[0] if all_2d_cols else None)
+        
+        if url_y and url_y in all_2d_cols:
+            default_2d_y = url_y
+        else:
+            default_2d_y = find_default_field(df, ["metrics.fidelity", "metrics.l2_error"]) or (all_2d_cols[1] if len(all_2d_cols) > 1 else None)
+        
+        if url_color and url_color in categorical_cols:
+            default_2d_color = url_color
+        else:
+            default_2d_color = find_default_field(df, ["algorithm", "config.backend"]) or None
         
         col1, col2, col3 = st.columns(3)
         with col1:
-            x_idx = numeric_cols.index(default_2d_x) if default_2d_x in numeric_cols else 0
-            x_axis = st.selectbox("X Axis", options=numeric_cols, index=x_idx if numeric_cols else None, key="2d_x")
+            x_idx = all_2d_cols.index(default_2d_x) if default_2d_x in all_2d_cols else 0
+            x_axis = st.selectbox("X Axis", options=all_2d_cols, index=x_idx if all_2d_cols else None, key="2d_x")
         with col2:
-            y_idx = numeric_cols.index(default_2d_y) if default_2d_y in numeric_cols else min(1, len(numeric_cols)-1)
-            y_axis = st.selectbox("Y Axis", options=numeric_cols, index=y_idx if numeric_cols else None, key="2d_y")
+            y_idx = all_2d_cols.index(default_2d_y) if default_2d_y in all_2d_cols else min(1, len(all_2d_cols)-1)
+            y_axis = st.selectbox("Y Axis", options=all_2d_cols, index=y_idx if all_2d_cols else None, key="2d_y")
         with col3:
             color_opts = ["None"] + categorical_cols
             color_idx = color_opts.index(default_2d_color) if default_2d_color in color_opts else 0
