@@ -8,10 +8,6 @@ version = "0.1.0"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
-    "qiskit>=2.0",
-    "qiskit-ibm-runtime",
-    "qiskit_qasm3_import",
-    "qiskit_aer",
     "matplotlib",
     "numpy",
     "duckdb",

@@ -15,7 +15,6 @@ import socket
 import uuid
 
 from qiskit_aer import AerSimulator
-from q8020_cfd_metautil.qiskit_circuit import get_backend_info
 
 
 def _generate_id() -> str:
@@ -153,9 +152,14 @@ def _make_ibm_backend_meta(backend: AerSimulator) -> dict[str, Any]:
     Returns:
         Backend dict ready for create_experiment_meta
     """
+    info = {"name": backend.name, "vendor": "ibm"}
     
-    info = get_backend_info(backend)
-    info["vendor"] = "ibm"
+    options = backend.options
+    info["noise"] = hasattr(options, 'noise_model') and options.noise_model is not None
+    
+    if hasattr(options, 'coupling_map') and options.coupling_map is not None:
+        info["coupling_map"] = options.coupling_map
+    
     return info
 
 
@@ -175,19 +179,6 @@ def make_backend_meta(backend: Any) -> dict[str, Any]:
     if isinstance(backend, AerSimulator):
         return _make_ibm_backend_meta(backend)
     raise TypeError(f"Unsupported backend type: {type(backend).__name__}")
-
-
-def make_experiment_id_meta(name: str) -> dict[str, str]:
-    """
-    Build experiment identification dict.
-
-    Args:
-        name: User-provided display name for the experiment
-
-    Returns:
-        Experiment dict ready for create_experiment_meta
-    """
-    return {"name": name}
 
 
 def make_experiment_meta(
