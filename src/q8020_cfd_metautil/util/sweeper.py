@@ -19,11 +19,11 @@ Function Categories:
         - get_library_versions: Capture installed package versions for reproducibility
 
 Directory Structure:
-    <run_uuid>/
+    wf_<workflow_id>/
         sweep_results.json          # Overall sweep metadata
         expanded_cases.json         # All parameter combinations
-        <case_id>/
-            params.json             # Case-specific parameters
+        <experiment_id>/
+            params.json             # Experiment-specific parameters
             stdout.json             # Script output (standardized format)
             *.png, *.pdf            # Generated visualizations
 
@@ -50,49 +50,22 @@ import json
 import os
 import shutil
 import sys
-import uuid
-import importlib.metadata
 from pathlib import Path
 from datetime import datetime
 from itertools import product
 
 import tomllib
 
+from q8020_cfd_metautil.make_meta import (
+    _generate_experiment_id,
+    _generate_workflow_id,
+    _make_library_meta,
+)
+
 # ANSI color codes
 GREEN = '\033[92m'
 RED = '\033[91m'
 RESET = '\033[0m'
-
-def get_library_versions() -> dict:
-    """
-    Capture versions of key libraries in the current environment.
-    
-    Returns:
-        Dictionary mapping package names to version strings
-    """
-    packages = [
-        "qrisp",
-        "qiskit",
-        "qiskit-aer",
-        "qiskit-ibm-runtime",
-        "qiskit-algorithms",
-        "qiskit-nature",
-        "qiskit-addon-sqd",
-        "numpy",
-        "scipy",
-        "pennylane",
-        "pyscf",
-        "tomli"
-    ]
-    
-    versions = {}
-    for package in packages:
-        try:
-            versions[package] = importlib.metadata.version(package)
-        except importlib.metadata.PackageNotFoundError:
-            versions[package] = "not installed"
-    
-    return versions
 
 
 def expand_case_lists(case_id: str, case_params: dict) -> list:
@@ -361,9 +334,9 @@ def run_sweep(toml_path: str, script: str, arg_mapping: dict = None, dry_run: bo
     if not dry_run:
         output_dir.mkdir(parents=True, exist_ok=True)
     
-    # Create run subdirectory with short UUID
-    run_id = uuid.uuid4().hex[:8]  # 8-character hex string
-    run_dir = output_dir / run_id
+    # Create run subdirectory with workflow ID (wf_ prefix)
+    workflow_id = _generate_workflow_id()
+    run_dir = output_dir / workflow_id
     
     # Count total cases across all groups
     total_cases = sum(len(g["expanded_cases"]) for g in groups.values())
@@ -387,12 +360,12 @@ def run_sweep(toml_path: str, script: str, arg_mapping: dict = None, dry_run: bo
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     
     # Capture library versions once for the entire sweep
-    library_versions = get_library_versions()
+    library_versions = _make_library_meta()
     
     results = {
         "config_file": str(toml_path),
         "output_dir": str(output_dir),
-        "run_id": run_id,
+        "workflow_id": workflow_id,
         "run_dir": str(run_dir),
         "timestamp": timestamp,
         "library_versions": library_versions,
@@ -437,39 +410,58 @@ def run_sweep(toml_path: str, script: str, arg_mapping: dict = None, dry_run: bo
                 group_case_dirs.append(run_dir / case_id)
                 continue
             
-            # Create case output directory
-            case_dir = run_dir / case_id
+            # Generate experiment_id for this case
+            experiment_id = _generate_experiment_id()
+            
+            # Create case output directory using experiment_id
+            case_dir = run_dir / experiment_id
             case_dir.mkdir(parents=True, exist_ok=True)
             group_case_dirs.append(case_dir)
             
-            # Save case parameters (include run_id)
-            params_with_run_id = params.copy()
-            params_with_run_id["_run_id"] = run_id
+            # Save case parameters (include workflow_id and experiment_id)
+            params_with_ids = params.copy()
+            params_with_ids["_workflow_id"] = workflow_id
+            params_with_ids["_experiment_id"] = experiment_id
+            params_with_ids["_case_id"] = case_id  # Keep original case_id for reference
             params_file = case_dir / "params.json"
             with open(params_file, "w", encoding="utf-8") as f:
-                json.dump(params_with_run_id, f, indent=2)
+                json.dump(params_with_ids, f, indent=2)
             
             # Write case START marker
             case_start_file = case_dir / "START"
             with open(case_start_file, "w", encoding="utf-8") as f:
                 f.write(datetime.now().isoformat())
             
+            # Append ID args to command so script knows its IDs
+            cmd_with_ids = cmd + [
+                "--experiment-id", experiment_id,
+                "--workflow-id", workflow_id
+            ]
+            
             # Run the command
-            stdout_file = case_dir / "stdout.json"
             stderr_file = case_dir / "stderr.txt"
             
             try:
                 result = subprocess.run(
-                    cmd,
+                    cmd_with_ids,
                     capture_output=True,
                     text=True,
                     timeout=3600,  # 1 hour timeout
                     check=False
                 )
                 
-                # Save stdout (expected to be JSON)
-                with open(stdout_file, "w", encoding="utf-8") as f:
-                    f.write(result.stdout)
+                # Detect if stdout is JSON and use appropriate extension
+                stdout_content = result.stdout.strip()
+                if stdout_content:
+                    try:
+                        json_data = json.loads(stdout_content)
+                        stdout_file = case_dir / "stdout.json"
+                        with open(stdout_file, "w", encoding="utf-8") as f:
+                            json.dump(json_data, f, indent=2)
+                    except json.JSONDecodeError:
+                        stdout_file = case_dir / "stdout.dat"
+                        with open(stdout_file, "w", encoding="utf-8") as f:
+                            f.write(stdout_content)
                 
                 # Save stderr
                 with open(stderr_file, "w", encoding="utf-8") as f:
@@ -481,7 +473,9 @@ def run_sweep(toml_path: str, script: str, arg_mapping: dict = None, dry_run: bo
                     f.write(datetime.now().isoformat())
                 
                 case_result = {
-                    "command": cmd,
+                    "command": cmd_with_ids,
+                    "case_id": case_id,
+                    "experiment_id": experiment_id,
                     "status": "success" if result.returncode == 0 else "error",
                     "returncode": result.returncode,
                     "output_dir": str(case_dir)
@@ -496,7 +490,9 @@ def run_sweep(toml_path: str, script: str, arg_mapping: dict = None, dry_run: bo
             
             except subprocess.TimeoutExpired:
                 case_result = {
-                    "command": cmd,
+                    "command": cmd_with_ids,
+                    "case_id": case_id,
+                    "experiment_id": experiment_id,
                     "status": "timeout",
                     "output_dir": str(case_dir)
                 }
@@ -504,14 +500,16 @@ def run_sweep(toml_path: str, script: str, arg_mapping: dict = None, dry_run: bo
             
             except Exception as e:
                 case_result = {
-                    "command": cmd,
+                    "command": cmd_with_ids,
+                    "case_id": case_id,
+                    "experiment_id": experiment_id,
                     "status": "exception",
                     "error": str(e),
                     "output_dir": str(case_dir)
                 }
                 print(f"    {RED}✗ Exception: {e}{RESET}")
             
-            results["cases"][case_id] = case_result
+            results["cases"][experiment_id] = case_result
         
         # Run group postproc for this group if specified
         group_postproc = group_params.get("_group_postproc", [])
@@ -523,7 +521,7 @@ def run_sweep(toml_path: str, script: str, arg_mapping: dict = None, dry_run: bo
             # Prepare postproc data
             postproc_data = {
                 "group_id": group_id,
-                "run_id": run_id,
+                "workflow_id": workflow_id,
                 "run_dir": str(run_dir),
                 "case_dirs": [str(d) for d in group_case_dirs],
                 "params": group_params
@@ -552,7 +550,7 @@ def run_sweep(toml_path: str, script: str, arg_mapping: dict = None, dry_run: bo
         
         # Write final_postproc JSON file
         final_postproc_data = {
-            "run_id": run_id,
+            "workflow_id": workflow_id,
             "run_dir": str(run_dir),
             "case_dirs": all_case_dirs,
             "groups": list(groups.keys()),
@@ -585,7 +583,7 @@ def run_sweep(toml_path: str, script: str, arg_mapping: dict = None, dry_run: bo
 # *****************************************************************************
 # CLI
 
-if __name__ == "__main__":
+def main():
     import argparse
     
     parser = argparse.ArgumentParser(
@@ -641,3 +639,7 @@ Usage:
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

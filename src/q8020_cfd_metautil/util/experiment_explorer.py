@@ -43,7 +43,7 @@ from watchdog.events import FileSystemEventHandler, FileCreatedEvent, FileModifi
 # Default axis mappings for common field names
 DEFAULT_AXES = {
     "x": ["_case_id", "problem.dimension", "config.shots", "param.size"],
-    "y": ["metrics.fidelity", "metrics.l2_error", "circuit_info.depth", "circuit_info.num_qubits"],
+    "y": ["metrics.fidelity", "metrics.l2_error_normalized", "circuit_info.depth", "circuit_info.num_qubits"],
     "z": ["algorithm", "script_name", "config.backend", "backend_info.backend_name"],
     "color": ["algorithm", "config.backend", "_run_id", "status"]
 }
@@ -515,7 +515,7 @@ def main():
         
         # Find best defaults
         default_x = find_default_field(df, ["_case_id", "problem.dimension", "config.shots"]) or (all_plottable[0] if all_plottable else None)
-        default_y = find_default_field(df, ["metrics.fidelity", "metrics.l2_error", "circuit_info.depth"]) or (all_plottable[1] if len(all_plottable) > 1 else None)
+        default_y = find_default_field(df, ["metrics.fidelity", "metrics.l2_error_normalized", "circuit_info.depth"]) or (all_plottable[1] if len(all_plottable) > 1 else None)
         default_z = find_default_field(df, ["circuit_info.num_qubits", "circuit_info.depth", "config.shots"]) or (all_plottable[2] if len(all_plottable) > 2 else None)
         default_color = find_default_field(df, ["algorithm", "config.backend", "status"]) or (categorical_cols[0] if categorical_cols else None)
         
@@ -589,7 +589,7 @@ def main():
         if url_y and url_y in all_2d_cols:
             default_2d_y = url_y
         else:
-            default_2d_y = find_default_field(df, ["metrics.fidelity", "metrics.l2_error"]) or (all_2d_cols[1] if len(all_2d_cols) > 1 else None)
+            default_2d_y = find_default_field(df, ["metrics.fidelity", "metrics.l2_error_normalized"]) or (all_2d_cols[1] if len(all_2d_cols) > 1 else None)
         
         if url_color and url_color in categorical_cols:
             default_2d_color = url_color
