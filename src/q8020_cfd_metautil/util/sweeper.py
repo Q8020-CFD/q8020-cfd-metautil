@@ -19,7 +19,7 @@ Function Categories:
         - get_library_versions: Capture installed package versions for reproducibility
 
 Directory Structure:
-    wf_<workflow_id>/
+    _<workflow_id>/
         sweep_results.json          # Overall sweep metadata
         expanded_cases.json         # All parameter combinations
         <experiment_id>/
@@ -334,7 +334,7 @@ def run_sweep(toml_path: str, script: str, arg_mapping: dict = None, dry_run: bo
     if not dry_run:
         output_dir.mkdir(parents=True, exist_ok=True)
     
-    # Create run subdirectory with workflow ID (wf_ prefix)
+    # Create run subdirectory with workflow ID (_ prefix)
     workflow_id = _generate_workflow_id()
     run_dir = output_dir / workflow_id
     

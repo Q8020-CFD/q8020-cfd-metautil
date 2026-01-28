@@ -5,13 +5,13 @@ workflow folder structure so even ad-hoc runs are tracked and visible
 in the experiment explorer.
 
 Output structure:
-    ~/q8020/wf_<experiment_id>/<experiment_id>/
+    ~/q8020/_<experiment_id>/<experiment_id>/
         stdout.json    - Script output (expects JSON)
         stderr.txt     - Any stderr output
         params.json    - Command-line args and metadata
 
-For single runs, workflow_id = wf_<experiment_id> so directory depth
-matches sweep runs: wf_<workflow_id>/<experiment_id>/
+For single runs, workflow_id = _<experiment_id> so directory depth
+matches sweep runs: _<workflow_id>/<experiment_id>/
 
 Usage:
     # Basic - auto-generates experiment ID

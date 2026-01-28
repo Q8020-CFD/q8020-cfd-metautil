@@ -29,17 +29,17 @@ def _generate_experiment_id() -> str:
 
 def _generate_workflow_id(experiment_id: Optional[str] = None) -> str:
     """
-    Generate a workflow ID with wf_ prefix.
+    Generate a workflow ID with _ prefix.
     
     For sweeps: generates a new workflow ID.
-    For single runs: uses the experiment_id so wf_<exp_id>/<exp_id> structure.
+    For single runs: uses the experiment_id so _<exp_id>/<exp_id> structure.
     
     Args:
-        experiment_id: If provided, workflow_id = wf_<experiment_id>
+        experiment_id: If provided, workflow_id = _<experiment_id>
     """
     if experiment_id:
-        return f"wf_{experiment_id}"
-    return f"wf_{_generate_id()}"
+        return f"_{experiment_id}"
+    return f"_{_generate_id()}"
 
 
 def _make_user_meta() -> dict[str, str]:
