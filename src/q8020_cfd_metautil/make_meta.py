@@ -163,12 +163,13 @@ def _make_ibm_backend_meta(backend: AerSimulator) -> dict[str, Any]:
     return info
 
 
-def make_backend_meta(backend: Any) -> dict[str, Any]:
+def make_backend_meta(backend: Any, **extras: Any) -> dict[str, Any]:
     """
     Build backend dict for any supported backend.
 
     Args:
         backend: A backend instance (currently supports AerSimulator)
+        **extras: Additional backend-specific fields to include
 
     Returns:
         Backend dict ready for create_experiment_meta
@@ -177,7 +178,9 @@ def make_backend_meta(backend: Any) -> dict[str, Any]:
         TypeError: If backend type is not supported
     """
     if isinstance(backend, AerSimulator):
-        return _make_ibm_backend_meta(backend)
+        info = _make_ibm_backend_meta(backend)
+        info.update(extras)
+        return info
     raise TypeError(f"Unsupported backend type: {type(backend).__name__}")
 
 
