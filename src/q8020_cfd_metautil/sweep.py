@@ -22,9 +22,9 @@ Directory Structure:
         q8020_expanded_cases.json       # All parameter combinations
         q8020_<config>.toml             # Copy of input TOML
         <experiment_id>/
-            q8020_params.json           # Case parameters with IDs
-            q8020_stdout.txt            # Script stdout
-            q8020_stderr.txt            # Script stderr
+            q8020_params_<exp_id>.json    # Case parameters with IDs
+            q8020_stdout_<exp_id>.txt     # Script stdout
+            q8020_stderr_<exp_id>.txt     # Script stderr
             q8020_metadata_<exp_id>.json  # Unified metadata (harvested)
             q8020_experiment_<exp_id>_0.json  # Metadata fragments
             q8020_case_<exp_id>_0.json
@@ -380,8 +380,8 @@ def run_single(
     if artifact_dir is None:
         artifact_dir = case_dir
 
-    stderr_file = case_dir / "q8020_stderr.txt"
-    params_file = case_dir / "q8020_params.json"
+    stderr_file = case_dir / f"q8020_stderr_{experiment_id}.txt"
+    params_file = case_dir / f"q8020_params_{experiment_id}.json"
 
     cwd = os.getcwd()
 
@@ -389,7 +389,7 @@ def run_single(
     env_before = None
     if env_path:
         env_before = capture_lib_snapshot(env_path)
-        env_before_file = case_dir / "q8020_env_before.json"
+        env_before_file = case_dir / f"q8020_env_before_{experiment_id}.json"
         with open(env_before_file, "w", encoding="utf-8") as f:
             json.dump(env_before, f, indent=2)
 
@@ -460,7 +460,7 @@ def run_single(
 
         # Write stdout
         stdout_content = result.stdout.strip()
-        stdout_file = case_dir / "q8020_stdout.txt"
+        stdout_file = case_dir / f"q8020_stdout_{experiment_id}.txt"
         with open(stdout_file, "w", encoding="utf-8") as f:
             f.write(stdout_content)
 
@@ -562,7 +562,7 @@ def run_single(
     env_after = None
     if env_path:
         env_after = capture_lib_snapshot(env_path)
-        env_after_file = case_dir / "q8020_env_after.json"
+        env_after_file = case_dir / f"q8020_env_after_{experiment_id}.json"
         with open(env_after_file, "w", encoding="utf-8") as f:
             json.dump(env_after, f, indent=2)
 
@@ -960,7 +960,7 @@ def run_sweep(toml_path: str, script: str, arg_mapping: dict = None, dry_run: bo
                 if case_postproc:
                     if isinstance(case_postproc, str):
                         case_postproc = [case_postproc]
-                    case_postproc_json = case_dir / "q8020_case_postproc.json"
+                    case_postproc_json = case_dir / f"q8020_case_postproc_{experiment_id}.json"
                     run_postproc(case_postproc, case_postproc_json, script_dir, dry_run)
                 continue
 
@@ -1002,7 +1002,7 @@ def run_sweep(toml_path: str, script: str, arg_mapping: dict = None, dry_run: bo
                     "case_dir": str(case_dir),
                     "params": params,
                 }
-                case_postproc_json = case_dir / "q8020_case_postproc.json"
+                case_postproc_json = case_dir / f"q8020_case_postproc_{experiment_id}.json"
                 if not dry_run:
                     with open(case_postproc_json, "w", encoding="utf-8") as f:
                         json.dump(case_postproc_data, f, indent=2)

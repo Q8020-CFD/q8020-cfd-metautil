@@ -18,16 +18,12 @@ from pathlib import Path
 from typing import Any
 
 from q8020_cfd_metautil.meta_fragment import (
-    generate_experiment_id,
-    generate_workflow_id,
-    make_user_meta,
     write_analysis,
     write_artifacts,
     write_backend,
     write_case,
     write_code,
     write_exec_stats,
-    write_experiment,
     write_results,
 )
 
@@ -173,12 +169,16 @@ def _extract_residuals(outdir: Path) -> list[dict[str, float]]:
     return _parse_csv_to_floats(csv_files[0])
 
 
-def generate_metadata(outdir: Path) -> dict[str, Any]:
+def generate_metadata(outdir: Path, experiment_id: str | None = None) -> dict[str, Any]:
     """
     Generate structured metadata from FVM Euler 1D solver output.
 
+    This harvester only writes solver-specific metadata fragments.
+    The sweeper handles experiment/workflow IDs, user info, and params.
+
     Args:
         outdir: Path to the solver output directory
+        experiment_id: Experiment ID from sweeper (used for fragment filenames)
 
     Returns:
         Metadata dict conforming to make_meta schema
@@ -190,32 +190,7 @@ def generate_metadata(outdir: Path) -> dict[str, Any]:
     residuals = _extract_residuals(outdir)
     file_inventory = _inventory_files(outdir)
 
-    # Build experiment section
-    # Read IDs from q8020_params.json if running under sweeper, else generate new ones
-    params_file = outdir / "q8020_params.json"
-    if params_file.exists():
-        with open(params_file, "r", encoding="utf-8") as f:
-            sweep_params = json.load(f)
-        experiment_id = sweep_params.get("experiment_id") or generate_experiment_id()
-        workflow_id = sweep_params.get("workflow_id") or generate_workflow_id(experiment_id)
-    else:
-        experiment_id = generate_experiment_id()
-        workflow_id = generate_workflow_id(experiment_id)
-    timestamp = run_params.get(
-        "timestamp",
-        datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-    )
-
-    experiment = {
-        "_source": "solver",
-        "name": "fvm_euler_1d",
-        "experiment_id": experiment_id,
-        "workflow_id": workflow_id,
-        "timestamp": timestamp,
-        "user": make_user_meta(),
-    }
-
-    # Build case section (problem definition)
+    # Build case section (problem definition - solver-specific)
     case = {
         "_source": "solver",
         "name": "nozzle_1d",
@@ -236,11 +211,10 @@ def generate_metadata(outdir: Path) -> dict[str, Any]:
         },
     }
 
-    # Build code section (library_versions captured by sweeper via _env snapshots)
+    # Build code section (solver-specific; library_versions captured by sweeper via _env)
     code = {
         "_source": "solver",
         "algorithm": run_params.get("linear_solver", "HHL"),
-        "entry_point": "nozzle_1d_solver.py",
     }
 
     # Build backend section
@@ -289,8 +263,7 @@ def generate_metadata(outdir: Path) -> dict[str, Any]:
         "hhl_metrics": hhl_metrics,
     }
 
-    # Write fragments (sweeper handles the metadata.json rollup)
-    write_experiment(outdir, experiment, experiment_id=experiment_id)
+    # Write solver-specific fragments (sweeper handles experiment, params, IDs)
     write_case(outdir, case, experiment_id=experiment_id)
     write_code(outdir, code, experiment_id=experiment_id)
     write_backend(outdir, backend, experiment_id=experiment_id)
@@ -324,11 +297,13 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    # Determine outdir from either --outdir or postproc JSON
+    # Determine outdir and experiment_id from either --outdir or postproc JSON
+    experiment_id = None
     if args.postproc_json:
         with open(args.postproc_json, "r", encoding="utf-8") as f:
             postproc_data = json.load(f)
         outdir = Path(postproc_data["case_dir"]).expanduser().resolve()
+        experiment_id = postproc_data.get("experiment_id")
     elif args.outdir:
         outdir = Path(args.outdir).expanduser().resolve()
     else:
@@ -339,7 +314,7 @@ def main() -> None:
         print(f"Error: Output directory does not exist: {outdir}", file=sys.stderr)
         sys.exit(1)
 
-    generate_metadata(outdir)
+    generate_metadata(outdir, experiment_id=experiment_id)
 
     print(f"✅ Metadata fragments written to: {outdir}", file=sys.stderr)
 
