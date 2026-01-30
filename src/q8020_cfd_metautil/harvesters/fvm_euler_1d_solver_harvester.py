@@ -17,11 +17,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from q8020_cfd_metautil.harvest import harvest_metadata
 from q8020_cfd_metautil.meta_fragment import (
     generate_experiment_id,
     generate_workflow_id,
-    make_library_meta,
     make_user_meta,
     write_analysis,
     write_artifacts,
@@ -68,7 +66,10 @@ def _load_pickle(pkl_path: Path) -> dict[str, Any] | None:
 
 
 def _inventory_files(outdir: Path) -> dict[str, list[dict[str, Any]]]:
-    """Categorize files in output directory by type."""
+    """Categorize FVM solver-created files in output directory by type.
+    
+    Skips sweeper-created files (q8020_*, stdout.txt, stderr.txt, metadata.json, etc.)
+    """
     inventory: dict[str, list[dict[str, Any]]] = {
         "qpy_generated": [],
         "qpy_transpiled": [],
@@ -80,6 +81,10 @@ def _inventory_files(outdir: Path) -> dict[str, list[dict[str, Any]]]:
 
     for file_path in outdir.iterdir():
         if not file_path.is_file():
+            continue
+
+        # Skip sweeper-created files (all prefixed with q8020_)
+        if file_path.name.startswith("q8020_"):
             continue
 
         stat = file_path.stat()
@@ -186,14 +191,23 @@ def generate_metadata(outdir: Path) -> dict[str, Any]:
     file_inventory = _inventory_files(outdir)
 
     # Build experiment section
-    experiment_id = generate_experiment_id()
-    workflow_id = generate_workflow_id(experiment_id)
+    # Read IDs from q8020_params.json if running under sweeper, else generate new ones
+    params_file = outdir / "q8020_params.json"
+    if params_file.exists():
+        with open(params_file, "r", encoding="utf-8") as f:
+            sweep_params = json.load(f)
+        experiment_id = sweep_params.get("experiment_id") or generate_experiment_id()
+        workflow_id = sweep_params.get("workflow_id") or generate_workflow_id(experiment_id)
+    else:
+        experiment_id = generate_experiment_id()
+        workflow_id = generate_workflow_id(experiment_id)
     timestamp = run_params.get(
         "timestamp",
         datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     )
 
     experiment = {
+        "_source": "solver",
         "name": "fvm_euler_1d",
         "experiment_id": experiment_id,
         "workflow_id": workflow_id,
@@ -203,6 +217,7 @@ def generate_metadata(outdir: Path) -> dict[str, Any]:
 
     # Build case section (problem definition)
     case = {
+        "_source": "solver",
         "name": "nozzle_1d",
         "nelem": run_params.get("nelem"),
         "time_scheme": run_params.get("time_scheme"),
@@ -221,15 +236,16 @@ def generate_metadata(outdir: Path) -> dict[str, Any]:
         },
     }
 
-    # Build code section
+    # Build code section (library_versions captured by sweeper via _env snapshots)
     code = {
+        "_source": "solver",
         "algorithm": run_params.get("linear_solver", "HHL"),
         "entry_point": "nozzle_1d_solver.py",
-        "library_versions": make_library_meta(),
     }
 
     # Build backend section
     backend = {
+        "_source": "solver",
         "type": run_params.get("backend_type", "ideal"),
         "method": run_params.get("backend_method", "statevector"),
         "nshots": run_params.get("nshots", 0),
@@ -240,6 +256,7 @@ def generate_metadata(outdir: Path) -> dict[str, Any]:
 
     # Build artifacts section
     artifacts = {
+        "_source": "solver",
         "directory": str(outdir.resolve()),
         "circuits": {
             "generated": file_inventory["qpy_generated"],
@@ -253,6 +270,7 @@ def generate_metadata(outdir: Path) -> dict[str, Any]:
 
     # Build exec_stats section
     exec_stats = {
+        "_source": "solver",
         "elapsed_time": run_params.get("elapsed_time"),
         "final_iters": run_params.get("final_iters"),
         "final_residual": run_params.get("final_residual"),
@@ -260,38 +278,35 @@ def generate_metadata(outdir: Path) -> dict[str, Any]:
 
     # Build results section
     results = {
+        "_source": "solver",
         "final_solution": final_results,
         "residual_history": residuals,
     }
 
     # Build analysis section with per-iteration metrics
     analysis = {
+        "_source": "solver",
         "hhl_metrics": hhl_metrics,
     }
 
-    # Write fragments
-    write_experiment(outdir, experiment)
-    write_case(outdir, case)
-    write_code(outdir, code)
-    write_backend(outdir, backend)
-    write_artifacts(outdir, artifacts)
-    write_exec_stats(outdir, exec_stats)
-    write_results(outdir, results)
-    write_analysis(outdir, analysis)
-
-    # Harvest all fragments into unified metadata
-    unified_metadata, warnings, _ = harvest_metadata(outdir)
-    return unified_metadata, warnings
+    # Write fragments (sweeper handles the metadata.json rollup)
+    write_experiment(outdir, experiment, experiment_id=experiment_id)
+    write_case(outdir, case, experiment_id=experiment_id)
+    write_code(outdir, code, experiment_id=experiment_id)
+    write_backend(outdir, backend, experiment_id=experiment_id)
+    write_artifacts(outdir, artifacts, experiment_id=experiment_id)
+    write_exec_stats(outdir, exec_stats, experiment_id=experiment_id)
+    write_results(outdir, results, experiment_id=experiment_id)
+    write_analysis(outdir, analysis, experiment_id=experiment_id)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Generate metadata JSON from FVM Euler 1D solver output",
+        description="Generate metadata fragments from FVM Euler 1D solver output",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Examples:
   fvm-euler-1d-meta --outdir /tmp/fvm
-  fvm-euler-1d-meta --outdir /tmp/fvm --output metadata.json
-  fvm-euler-1d-meta /path/to/_case_postproc.json  (sweep postproc mode)
+  fvm-euler-1d-meta /path/to/q8020_case_postproc.json  (sweep postproc mode)
 """,
     )
     parser.add_argument(
@@ -299,12 +314,6 @@ def main() -> None:
         type=str,
         default=None,
         help="Path to solver output directory",
-    )
-    parser.add_argument(
-        "--output", "-o",
-        type=str,
-        default=None,
-        help="Output JSON file path; defaults to <outdir>/metadata.json",
     )
     parser.add_argument(
         "postproc_json",
@@ -330,16 +339,9 @@ def main() -> None:
         print(f"Error: Output directory does not exist: {outdir}", file=sys.stderr)
         sys.exit(1)
 
-    metadata, warnings = generate_metadata(outdir)
+    generate_metadata(outdir)
 
-    for warning in warnings:
-        print(f"⚠️  {warning}", file=sys.stderr)
-
-    output_path = Path(args.output) if args.output else outdir / "metadata.json"
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(metadata, f, indent=2)
-
-    print(f"✅ Metadata written to: {output_path}", file=sys.stderr)
+    print(f"✅ Metadata fragments written to: {outdir}", file=sys.stderr)
 
 
 if __name__ == "__main__":

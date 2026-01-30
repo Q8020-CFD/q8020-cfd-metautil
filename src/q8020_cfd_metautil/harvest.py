@@ -17,12 +17,13 @@ from typing import Any
 
 from q8020_cfd_metautil.meta_fragment import (
     FRAGMENT_PATTERN,
-    MULTI_SECTIONS,
-    SINGLETON_SECTIONS,
+    SWEEP_FRAGMENT_PATTERN,
     VALID_SECTIONS,
-    make_library_meta,
     read_fragments,
 )
+
+# Re-export patterns for use by other modules
+__all__ = ["harvest_metadata", "get_fragment_files", "FRAGMENT_PATTERN", "SWEEP_FRAGMENT_PATTERN"]
 
 
 def harvest_metadata(
@@ -41,42 +42,14 @@ def harvest_metadata(
     warnings: list[str] = []
     metadata: dict[str, Any] = {}
 
-    # Process singleton sections
-    for section in SINGLETON_SECTIONS:
+    # All sections are multi - collect all fragments into lists
+    for section in VALID_SECTIONS:
         section_fragments = fragments.get(section, [])
         if not section_fragments:
-            metadata[section] = {}
-        elif len(section_fragments) == 1:
-            metadata[section] = section_fragments[0][1]
+            metadata[section] = []
         else:
-            warnings.append(
-                f"Multiple fragments found for singleton section '{section}' "
-                f"(indices: {[idx for idx, _ in section_fragments]}). Using index 0."
-            )
-            # Find index 0, or use first available
-            idx_0_data = next(
-                (data for idx, data in section_fragments if idx == 0),
-                section_fragments[0][1],
-            )
-            metadata[section] = idx_0_data
-
-    # Process multi-instance sections
-    for section in MULTI_SECTIONS:
-        section_fragments = fragments.get(section, [])
-        if not section_fragments:
-            metadata[section] = {}
-        elif len(section_fragments) == 1:
-            # Single fragment: use dict directly (unwrapped)
-            metadata[section] = section_fragments[0][1]
-        else:
-            # Multiple fragments: assemble into list ordered by index
+            # Collect all fragments ordered by index
             metadata[section] = [data for _, data in section_fragments]
-
-    # Inject library_versions into code section if not present
-    if "library_versions" not in metadata.get("code", {}):
-        if "code" not in metadata:
-            metadata["code"] = {}
-        metadata["code"]["library_versions"] = make_library_meta()
 
     # Build fragment counts
     fragment_counts = {section: len(frags) for section, frags in fragments.items()}

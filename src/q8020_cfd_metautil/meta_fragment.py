@@ -45,8 +45,10 @@ VALID_SECTIONS = frozenset([
 SINGLETON_SECTIONS = frozenset(["experiment", "case", "code", "backend"])
 MULTI_SECTIONS = frozenset(["artifacts", "exec_stats", "results", "analysis"])
 
-# Pattern: q8020_{section}_{index}.json
-FRAGMENT_PATTERN = re.compile(r"^q8020_([a-z_]+)_(\d+)\.json$")
+# Pattern: q8020_{section}_{index}.json or q8020_{section}_{exp_id}_{index}.json
+# Also: q8020_sweep_{section}_{index}.json or q8020_sweep_{section}_{exp_id}_{index}.json
+FRAGMENT_PATTERN = re.compile(r"^q8020_([a-z_]+)_(?:([a-f0-9]{8})_)?(\d+)\.json$")
+SWEEP_FRAGMENT_PATTERN = re.compile(r"^q8020_sweep_([a-z_]+)_(?:([a-f0-9]{8})_)?(\d+)\.json$")
 
 
 # ---------------------------------------------------------------------------
@@ -271,6 +273,8 @@ def write_fragment(
     section: str,
     data: dict[str, Any],
     index: int = 0,
+    prefix: str = "q8020",
+    experiment_id: str | None = None,
 ) -> Path:
     """
     Write a metadata section fragment to a JSON file.
@@ -280,6 +284,8 @@ def write_fragment(
         section: Section name (one of the 8 valid section names)
         data: Dict data to write
         index: Zero-based index for multiple fragments (default 0)
+        prefix: File prefix (default "q8020", sweeper uses "q8020_sweep")
+        experiment_id: Optional experiment ID to include in filename
 
     Returns:
         Path to the written file
@@ -296,7 +302,10 @@ def write_fragment(
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
 
-    filename = f"q8020_{section}_{index}.json"
+    if experiment_id:
+        filename = f"{prefix}_{section}_{experiment_id}_{index}.json"
+    else:
+        filename = f"{prefix}_{section}_{index}.json"
     filepath = outdir / filename
 
     with open(filepath, "w", encoding="utf-8") as f:
@@ -305,44 +314,44 @@ def write_fragment(
     return filepath
 
 
-def write_experiment(outdir: Path, data: dict[str, Any], index: int = 0) -> Path:
+def write_experiment(outdir: Path, data: dict[str, Any], index: int = 0, prefix: str = "q8020", experiment_id: str | None = None) -> Path:
     """Write experiment section fragment."""
-    return write_fragment(outdir, "experiment", data, index)
+    return write_fragment(outdir, "experiment", data, index, prefix, experiment_id)
 
 
-def write_case(outdir: Path, data: dict[str, Any], index: int = 0) -> Path:
+def write_case(outdir: Path, data: dict[str, Any], index: int = 0, prefix: str = "q8020", experiment_id: str | None = None) -> Path:
     """Write case section fragment."""
-    return write_fragment(outdir, "case", data, index)
+    return write_fragment(outdir, "case", data, index, prefix, experiment_id)
 
 
-def write_code(outdir: Path, data: dict[str, Any], index: int = 0) -> Path:
+def write_code(outdir: Path, data: dict[str, Any], index: int = 0, prefix: str = "q8020", experiment_id: str | None = None) -> Path:
     """Write code section fragment."""
-    return write_fragment(outdir, "code", data, index)
+    return write_fragment(outdir, "code", data, index, prefix, experiment_id)
 
 
-def write_backend(outdir: Path, data: dict[str, Any], index: int = 0) -> Path:
+def write_backend(outdir: Path, data: dict[str, Any], index: int = 0, prefix: str = "q8020", experiment_id: str | None = None) -> Path:
     """Write backend section fragment."""
-    return write_fragment(outdir, "backend", data, index)
+    return write_fragment(outdir, "backend", data, index, prefix, experiment_id)
 
 
-def write_artifacts(outdir: Path, data: dict[str, Any], index: int = 0) -> Path:
+def write_artifacts(outdir: Path, data: dict[str, Any], index: int = 0, prefix: str = "q8020", experiment_id: str | None = None) -> Path:
     """Write artifacts section fragment."""
-    return write_fragment(outdir, "artifacts", data, index)
+    return write_fragment(outdir, "artifacts", data, index, prefix, experiment_id)
 
 
-def write_exec_stats(outdir: Path, data: dict[str, Any], index: int = 0) -> Path:
+def write_exec_stats(outdir: Path, data: dict[str, Any], index: int = 0, prefix: str = "q8020", experiment_id: str | None = None) -> Path:
     """Write exec_stats section fragment."""
-    return write_fragment(outdir, "exec_stats", data, index)
+    return write_fragment(outdir, "exec_stats", data, index, prefix, experiment_id)
 
 
-def write_results(outdir: Path, data: dict[str, Any], index: int = 0) -> Path:
+def write_results(outdir: Path, data: dict[str, Any], index: int = 0, prefix: str = "q8020", experiment_id: str | None = None) -> Path:
     """Write results section fragment."""
-    return write_fragment(outdir, "results", data, index)
+    return write_fragment(outdir, "results", data, index, prefix, experiment_id)
 
 
-def write_analysis(outdir: Path, data: dict[str, Any], index: int = 0) -> Path:
+def write_analysis(outdir: Path, data: dict[str, Any], index: int = 0, prefix: str = "q8020", experiment_id: str | None = None) -> Path:
     """Write analysis section fragment."""
-    return write_fragment(outdir, "analysis", data, index)
+    return write_fragment(outdir, "analysis", data, index, prefix, experiment_id)
 
 
 def read_fragments(outdir: Path) -> dict[str, list[tuple[int, dict[str, Any]]]]:
@@ -369,15 +378,19 @@ def read_fragments(outdir: Path) -> dict[str, list[tuple[int, dict[str, Any]]]]:
             continue
 
         # Skip metadata.json (assembled output)
-        if filepath.name == "metadata.json":
+        if filepath.name == "metadata.json" or filepath.name == "q8020_metadata.json":
             continue
 
-        match = FRAGMENT_PATTERN.match(filepath.name)
+        # Try sweep pattern first (more specific), then general pattern
+        match = SWEEP_FRAGMENT_PATTERN.match(filepath.name)
+        if not match:
+            match = FRAGMENT_PATTERN.match(filepath.name)
         if not match:
             continue
 
         section = match.group(1)
-        index = int(match.group(2))
+        # Group 2 is optional exp_id, group 3 is index
+        index = int(match.group(3))
 
         if section not in VALID_SECTIONS:
             continue

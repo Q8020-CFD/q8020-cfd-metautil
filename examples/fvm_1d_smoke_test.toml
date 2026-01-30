@@ -1,28 +1,32 @@
-# FVM Euler 1D Solver - Single Case Configuration
-# Runs a single case with no parameter sweeps, then harvests metadata
-#
-# Usage:
-#   cd /Users/agallojr/proj/src/q8020-cfd/q8020-cfd-metautil
-#   q8020-sweep examples/fvm_single_case.toml
-#   q8020-sweep examples/fvm_single_case.toml --dry-run
+# FVM Euler 1D Solver - example invocation via q8020-sweeper 
 
 [global]
 _output_dir = "~/q8020"
-_venv = "./fvm_euler_1d_solver/.venv"
-_script = "./fvm_euler_1d_solver/nozzle_1d_solver.py"
-_inject_outdir = "outdir"
+_env = "./fvm_euler_1d_solver/.venv"
+_script = """\
+source ./fvm_euler_1d_solver/.venv/bin/activate && \
+python ./fvm_euler_1d_solver/nozzle_1d_solver.py\
+"""
 _case_postproc = [
     "python -m q8020_cfd_metautil.harvesters.fvm_euler_1d_solver_harvester"
 ]
+_inject_outdir = "-outdir"
+"-nelem" = 2
+"-time_scheme" = "BDF1"
+"-linsolver" = "HHL"
+"-localdt" = true
+"-noshow" = true
 
-[fvm_baseline]
-nelem = 2
-time_scheme = "BDF1"
-cfl = 1e5
-iters = 2000
-tol = 1e-10
-linsolver = "HHL"
-localdt = true
-noshow = true
+[ideal]
+
+[shots]
+"-shots" = 1024 
+
+[fake_real]
+"-backend" = "fake fake_guadalupe"
+"-shots" = 1024 
+
+
+
 
 

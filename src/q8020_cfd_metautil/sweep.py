@@ -18,19 +18,19 @@ Function Categories:
 
 Directory Structure:
     _<workflow_id>/
-        sweep_results.json              # Overall sweep metadata with start/end times
-        expanded_cases.json             # All parameter combinations
-        <config>.toml                   # Copy of input TOML
+        q8020_sweep_meta<workflow_id>.json   # Overall sweep metadata with start/end times
+        q8020_expanded_cases.json       # All parameter combinations
+        q8020_<config>.toml             # Copy of input TOML
         <experiment_id>/
-            params.json                 # Case parameters with IDs
-            stdout.txt                  # Script stdout
-            stderr.txt                  # Script stderr
-            metadata.json               # Unified metadata (harvested)
-            q8020_experiment_0.json     # Metadata fragments
-            q8020_case_0.json
-            q8020_code_0.json
-            q8020_exec_stats_0.json
-            q8020_artifacts_0.json
+            q8020_params.json           # Case parameters with IDs
+            q8020_stdout.txt            # Script stdout
+            q8020_stderr.txt            # Script stderr
+            q8020_metadata_<exp_id>.json  # Unified metadata (harvested)
+            q8020_experiment_<exp_id>_0.json  # Metadata fragments
+            q8020_case_<exp_id>_0.json
+            q8020_code_<exp_id>_0.json
+            q8020_exec_stats_<exp_id>_0.json
+            q8020_artifacts_<exp_id>_0.json
             *.png, *.pdf                # Generated visualizations
 
 TOML Configuration Format:
@@ -100,6 +100,121 @@ def _derive_experiment_name(command: list[str]) -> str:
     return "unknown"
 
 
+def _is_venv(path: Path) -> bool:
+    """Check if path looks like a Python virtual environment."""
+    path = path.expanduser().resolve()
+    # Check for typical venv structure
+    if (path / "bin" / "activate").exists() or (path / "Scripts" / "activate.bat").exists():
+        return True
+    if (path / "pyvenv.cfg").exists():
+        return True
+    return False
+
+
+def _capture_venv_packages(venv_path: Path) -> dict[str, Any]:
+    """Capture package versions from a venv using importlib.metadata (no pip required)."""
+    venv_path = venv_path.expanduser().resolve()
+    
+    # Find python executable
+    python_path = venv_path / "bin" / "python"
+    if not python_path.exists():
+        python_path = venv_path / "Scripts" / "python.exe"
+    
+    if not python_path.exists():
+        return {"error": f"python not found in {venv_path}"}
+    
+    # Use importlib.metadata to get installed packages (works without pip)
+    capture_script = """
+import importlib.metadata
+import json
+packages = {d.name: d.version for d in importlib.metadata.distributions()}
+print(json.dumps(packages))
+"""
+    
+    try:
+        result = subprocess.run(
+            [str(python_path), "-c", capture_script],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        
+        if result.returncode != 0:
+            return {"error": result.stderr.strip(), "path": str(venv_path)}
+        
+        packages = json.loads(result.stdout.strip())
+        
+        return {
+            "type": "venv",
+            "path": str(venv_path),
+            "packages": packages,
+            "package_count": len(packages),
+            "timestamp": _get_iso_timestamp(),
+        }
+    except Exception as e:
+        return {"error": str(e), "path": str(venv_path)}
+
+
+def _capture_dir_listing(dir_path: Path) -> dict[str, Any]:
+    """Capture detailed file listing for a directory."""
+    dir_path = dir_path.expanduser().resolve()
+    
+    if not dir_path.exists():
+        return {"error": f"Directory does not exist: {dir_path}"}
+    
+    if not dir_path.is_dir():
+        return {"error": f"Path is not a directory: {dir_path}"}
+    
+    files = []
+    total_size = 0
+    
+    try:
+        for file_path in dir_path.rglob("*"):
+            if file_path.is_file():
+                stat = file_path.stat()
+                total_size += stat.st_size
+                files.append({
+                    "path": str(file_path.relative_to(dir_path)),
+                    "size_bytes": stat.st_size,
+                    "modified": datetime.fromtimestamp(
+                        stat.st_mtime, tz=timezone.utc
+                    ).isoformat().replace("+00:00", "Z"),
+                })
+        
+        return {
+            "type": "directory",
+            "path": str(dir_path),
+            "files": files,
+            "file_count": len(files),
+            "total_size_bytes": total_size,
+            "timestamp": _get_iso_timestamp(),
+        }
+    except Exception as e:
+        return {"error": str(e), "path": str(dir_path)}
+
+
+def capture_lib_snapshot(lib_path: str | Path) -> dict[str, Any]:
+    """
+    Capture environment snapshot for a library path.
+    
+    If the path looks like a venv, captures pip freeze output.
+    Otherwise, captures a detailed file listing.
+    
+    Args:
+        lib_path: Path to library directory or venv
+        
+    Returns:
+        Dict with snapshot data
+    """
+    path = Path(lib_path).expanduser().resolve()
+    
+    if _is_venv(path):
+        return _capture_venv_packages(path)
+    else:
+        return _capture_dir_listing(path)
+
+
 def _inventory_artifacts(artifact_dir: Path) -> dict[str, Any]:
     """
     Scan directory and build artifact inventory.
@@ -111,6 +226,7 @@ def _inventory_artifacts(artifact_dir: Path) -> dict[str, Any]:
         Dict with directory path and list of file info dicts
     """
     result: dict[str, Any] = {
+        "_source": "sweep",
         "directory": str(artifact_dir.resolve()),
         "files": [],
     }
@@ -150,6 +266,7 @@ def _make_experiment_section(
 ) -> dict[str, Any]:
     """Build experiment metadata section."""
     return {
+        "_source": "sweep",
         "name": name,
         "experiment_id": experiment_id,
         "workflow_id": workflow_id,
@@ -180,6 +297,7 @@ def _make_case_section(
     if case_params is not None:
         # Sweep mode: include case_id and params
         return {
+            "_source": "sweep",
             "name": case_id or " ".join(command),
             "case_id": case_id,
             "params": case_params,
@@ -191,6 +309,7 @@ def _make_case_section(
         # Standalone mode: include args parsed from command
         raw_args = command[2:] if len(command) > 2 else []
         return {
+            "_source": "sweep",
             "name": case_id or " ".join(command),
             "command": command,
             "script": script,
@@ -199,16 +318,25 @@ def _make_case_section(
         }
 
 
-def _make_code_section(command: list[str]) -> dict[str, Any]:
-    """Build code metadata section."""
+def _make_code_section(
+    command: list[str],
+    env_before: dict[str, Any] | None = None,
+    env_after: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build code metadata section with optional library version snapshots."""
     interpreter = command[0] if command else "unknown"
     entry_point = command[1] if len(command) > 1 else None
 
-    return {
+    result: dict[str, Any] = {
+        "_source": "sweep",
         "entry_point": entry_point,
         "interpreter": interpreter,
-        "library_versions": make_library_meta(),
     }
+    if env_before is not None:
+        result["library_versions_before"] = env_before
+    if env_after is not None:
+        result["library_versions_after"] = env_after
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -224,7 +352,7 @@ def run_single(
     case_params: dict[str, Any] | None = None,
     timeout: int | None = None,
     artifact_dir: Path | None = None,
-    venv: str | None = None,
+    env_path: str | None = None,
 ) -> dict[str, Any]:
     """
     Run a single command with full metadata capture.
@@ -242,7 +370,7 @@ def run_single(
         timeout: Optional timeout in seconds
         artifact_dir: Directory where black box writes artifacts; defaults to
                       case_dir if not specified
-        venv: Path to virtual environment to activate before running
+        env_path: Path to environment/venv to snapshot before and after execution
 
     Returns:
         Result dict with command, case_id, experiment_id, status, returncode,
@@ -252,11 +380,18 @@ def run_single(
     if artifact_dir is None:
         artifact_dir = case_dir
 
-    stderr_file = case_dir / "stderr.txt"
-    params_file = case_dir / "params.json"
-    metadata_file = case_dir / "metadata.json"
+    stderr_file = case_dir / "q8020_stderr.txt"
+    params_file = case_dir / "q8020_params.json"
 
     cwd = os.getcwd()
+
+    # Capture environment snapshot before execution
+    env_before = None
+    if env_path:
+        env_before = capture_lib_snapshot(env_path)
+        env_before_file = case_dir / "q8020_env_before.json"
+        with open(env_before_file, "w", encoding="utf-8") as f:
+            json.dump(env_before, f, indent=2)
 
     # Build params.json content
     params_data: dict[str, Any] = {
@@ -295,18 +430,9 @@ def run_single(
     }
 
     try:
-        # Wrap command with venv activation if specified
-        if venv:
-            venv_path = Path(venv).expanduser().resolve()
-            activate_script = venv_path / "bin" / "activate"
-            shell_cmd = f"source {activate_script} && {' '.join(command_with_ids)}"
-            run_cmd = ["bash", "-c", shell_cmd]
-        else:
-            run_cmd = command_with_ids
-
         # Run the command, capturing stdout and stderr
         result = subprocess.run(
-            run_cmd,
+            command_with_ids,
             capture_output=True,
             text=True,
             check=False,
@@ -320,6 +446,7 @@ def run_single(
 
         # Build exec_stats
         exec_stats: dict[str, Any] = {
+            "_source": "sweep",
             "start_time": start_time,
             "end_time": end_time,
             "duration_seconds": duration_seconds,
@@ -331,9 +458,9 @@ def run_single(
         with open(stderr_file, "w", encoding="utf-8") as f:
             f.write(result.stderr)
 
-        # Write stdout (always stdout.txt)
+        # Write stdout
         stdout_content = result.stdout.strip()
-        stdout_file = case_dir / "stdout.txt"
+        stdout_file = case_dir / "q8020_stdout.txt"
         with open(stdout_file, "w", encoding="utf-8") as f:
             f.write(stdout_content)
 
@@ -351,22 +478,15 @@ def run_single(
             case_id=case_id,
             case_params=case_params,
         )
-        code_section = _make_code_section(command=command_with_ids)
         artifacts_section = _inventory_artifacts(artifact_dir)
 
-        write_experiment(case_dir, experiment_section)
-        write_case(case_dir, case_section)
-        write_code(case_dir, code_section)
-        write_exec_stats(case_dir, exec_stats)
-        write_artifacts(case_dir, artifacts_section)
+        write_experiment(case_dir, experiment_section, prefix="q8020_sweep", experiment_id=experiment_id)
+        write_case(case_dir, case_section, prefix="q8020_sweep", experiment_id=experiment_id)
+        # Note: write_code is deferred until after env_after is captured
+        write_exec_stats(case_dir, exec_stats, prefix="q8020_sweep", experiment_id=experiment_id)
+        write_artifacts(case_dir, artifacts_section, prefix="q8020_sweep", experiment_id=experiment_id)
 
-        # Harvest all fragments into metadata.json
-        unified_metadata, warnings, _ = harvest_metadata(case_dir)
-        for warning in warnings:
-            print(f"    ⚠️  {warning}", file=sys.stderr)
-
-        with open(metadata_file, "w", encoding="utf-8") as f:
-            json.dump(unified_metadata, f, indent=2)
+        # Note: harvest_metadata() is called by run_sweep() AFTER postproc completes
 
         result_dict["status"] = "success" if result.returncode == 0 else "error"
         result_dict["returncode"] = result.returncode
@@ -378,6 +498,7 @@ def run_single(
         duration_seconds = (end_dt - start_dt).total_seconds()
 
         exec_stats = {
+            "_source": "sweep",
             "start_time": start_time,
             "end_time": end_time,
             "duration_seconds": duration_seconds,
@@ -396,12 +517,10 @@ def run_single(
         case_section = _make_case_section(
             command=command_with_ids, cwd=cwd, case_id=case_id, case_params=case_params
         )
-        code_section = _make_code_section(command=command_with_ids)
-
-        write_experiment(case_dir, experiment_section)
-        write_case(case_dir, case_section)
-        write_code(case_dir, code_section)
-        write_exec_stats(case_dir, exec_stats)
+        write_experiment(case_dir, experiment_section, prefix="q8020_sweep", experiment_id=experiment_id)
+        write_case(case_dir, case_section, prefix="q8020_sweep", experiment_id=experiment_id)
+        # Note: write_code is deferred until after env_after is captured
+        write_exec_stats(case_dir, exec_stats, prefix="q8020_sweep", experiment_id=experiment_id)
 
         result_dict["status"] = "timeout"
 
@@ -412,6 +531,7 @@ def run_single(
         duration_seconds = (end_dt - start_dt).total_seconds()
 
         exec_stats = {
+            "_source": "sweep",
             "start_time": start_time,
             "end_time": end_time,
             "duration_seconds": duration_seconds,
@@ -430,15 +550,29 @@ def run_single(
         case_section = _make_case_section(
             command=command_with_ids, cwd=cwd, case_id=case_id, case_params=case_params
         )
-        code_section = _make_code_section(command=command_with_ids)
-
-        write_experiment(case_dir, experiment_section)
-        write_case(case_dir, case_section)
-        write_code(case_dir, code_section)
-        write_exec_stats(case_dir, exec_stats)
+        write_experiment(case_dir, experiment_section, prefix="q8020_sweep", experiment_id=experiment_id)
+        write_case(case_dir, case_section, prefix="q8020_sweep", experiment_id=experiment_id)
+        # Note: write_code is deferred until after env_after is captured
+        write_exec_stats(case_dir, exec_stats, prefix="q8020_sweep", experiment_id=experiment_id)
 
         result_dict["status"] = "exception"
         result_dict["error"] = str(e)
+
+    # Capture environment snapshot after execution
+    env_after = None
+    if env_path:
+        env_after = capture_lib_snapshot(env_path)
+        env_after_file = case_dir / "q8020_env_after.json"
+        with open(env_after_file, "w", encoding="utf-8") as f:
+            json.dump(env_after, f, indent=2)
+
+    # Write code fragment with both env snapshots (deferred from try/except blocks)
+    code_section = _make_code_section(
+        command=command_with_ids,
+        env_before=env_before,
+        env_after=env_after,
+    )
+    write_code(case_dir, code_section, prefix="q8020_sweep", experiment_id=experiment_id)
 
     return result_dict
 
@@ -498,8 +632,7 @@ def load_sweep_config(toml_path: str) -> dict:
     Expected structure:
         [global]  # or [_global]
         _output_dir = "./results"
-        _script = "src/solver.py"
-        _venv = "~/my_venv"
+        _script = "python src/solver.py"  # full command, can include venv activation
         _inject_outdir = "outdir"
         _case_postproc = ["python harvester.py"]
         _group_postproc = ["python group_postproc.py"]
@@ -560,32 +693,32 @@ def build_command_args(params: dict, arg_mapping: dict = None) -> list:
     """
     Convert parameter dict to command-line arguments.
     
-    Normalizes hyphenated parameter names to use underscores.
-    
     Args:
         params: Parameter dict from TOML
         arg_mapping: Optional dict mapping param names to CLI arg names
                      e.g., {"bond_length": "--bond-length"}
-                     If None, uses --{param_name} (preserving underscores/hyphens as-is)
+                     If None, uses --{param_name} with hyphens (argparse convention)
+                     Keys starting with "-" are used as-is (e.g., "-nelem" -> -nelem)
     
     Returns:
         List of command-line arguments
     """
     args = []
-    skip_keys = {"executable", "_output_dir", "_case_postproc", "_group_postproc", "_final_postproc", "_inject_outdir", "_venv"}
+    skip_keys = {"executable", "_output_dir", "_case_postproc", "_group_postproc", "_final_postproc", "_inject_outdir", "_env"}
     
     for key, value in params.items():
         if key in skip_keys or key.startswith("_"):
             continue
         
-        # Convert underscores to hyphens for CLI args (argparse convention)
-        cli_key = key.replace('_', '-')
-        
         # Determine CLI arg name
         if arg_mapping and key in arg_mapping:
             arg_name = arg_mapping[key]
+        elif key.startswith("-"):
+            # Key already has dash prefix, use as-is
+            arg_name = key
         else:
-            # Use hyphenated key for CLI args
+            # Default: double dash, convert underscores to hyphens: --key-name
+            cli_key = key.replace('_', '-')
             arg_name = f"--{cli_key}"
         
         # Handle different value types
@@ -604,7 +737,7 @@ def build_command_args(params: dict, arg_mapping: dict = None) -> list:
     return args
 
 
-def run_postproc(postproc_list: list, postproc_json: Path, script_dir: Path = None, dry_run: bool = False, venv: str = None) -> list:
+def run_postproc(postproc_list: list, postproc_json: Path, script_dir: Path = None, dry_run: bool = False) -> list:
     """
     Run postprocessing scripts with a JSON file as the single argument.
     
@@ -613,7 +746,6 @@ def run_postproc(postproc_list: list, postproc_json: Path, script_dir: Path = No
         postproc_json: Path to JSON file containing postproc context
         script_dir: Directory containing the script (added to PYTHONPATH for module imports)
         dry_run: If True, print commands without executing
-        venv: Path to virtual environment to activate before running
     
     Returns:
         List of results for each postproc command
@@ -632,13 +764,6 @@ def run_postproc(postproc_list: list, postproc_json: Path, script_dir: Path = No
     
     for postproc_cmd in postproc_list:
         cmd = postproc_cmd.split() + [str(postproc_json)]
-        
-        # Wrap command with venv activation if specified
-        if venv:
-            venv_path = Path(venv).expanduser().resolve()
-            activate_script = venv_path / "bin" / "activate"
-            shell_cmd = f"source {activate_script} && {' '.join(cmd)}"
-            cmd = ["bash", "-c", shell_cmd]
         
         if dry_run:
             print(f"  Postproc (dry-run): {' '.join(cmd)}")
@@ -741,10 +866,11 @@ def run_sweep(toml_path: str, script: str, arg_mapping: dict = None, dry_run: bo
 
     if not dry_run:
         run_dir.mkdir(parents=True, exist_ok=True)
-        # Copy input TOML to run directory
-        shutil.copy2(toml_path, run_dir / Path(toml_path).name)
+        # Copy input TOML to run directory with q8020_ prefix
+        toml_name = Path(toml_path).name
+        shutil.copy2(toml_path, run_dir / f"q8020_{toml_name}")
         # Write expanded cases to JSON before running
-        expanded_cases_file = run_dir / "expanded_cases.json"
+        expanded_cases_file = run_dir / "q8020_expanded_cases.json"
         all_cases = {}
         for group in groups.values():
             all_cases.update(group["expanded_cases"])
@@ -763,7 +889,7 @@ def run_sweep(toml_path: str, script: str, arg_mapping: dict = None, dry_run: bo
         "run_dir": str(run_dir),
         "timestamp": timestamp,
         "start_time": sweep_start_time,
-        "library_versions": library_versions,
+        "sweeper_library_versions": library_versions,
         "groups": {},
         "cases": {},
     }
@@ -780,7 +906,7 @@ def run_sweep(toml_path: str, script: str, arg_mapping: dict = None, dry_run: bo
         # Check for per-group _script override
         group_script = group_params.get("_script")
         if group_script:
-            group_executable = f"python {group_script}"
+            group_executable = group_script
         else:
             group_executable = executable
         
@@ -801,25 +927,32 @@ def run_sweep(toml_path: str, script: str, arg_mapping: dict = None, dry_run: bo
                 case_dir.mkdir(parents=True, exist_ok=True)
             group_case_dirs.append(case_dir)
 
-            # Build command - expand ~ in executable path
-            cmd_parts = group_executable.split()
-            cmd_parts = [str(Path(p).expanduser()) if p.startswith("~") or "/" in p or "\\" in p 
-                         else p for p in cmd_parts]
+            # Build command args
             cmd_args = build_command_args(params, arg_mapping)
-            cmd = cmd_parts + cmd_args
 
-            # Inject -outdir if _inject_outdir is set
+            # Inject outdir arg if _inject_outdir is set (value is the full arg name, e.g., "-outdir")
             inject_outdir = params.get("_inject_outdir")
             if inject_outdir:
-                cmd.extend([f"-{inject_outdir}", str(case_dir)])
+                cmd_args.extend([inject_outdir, str(case_dir)])
 
-            # Get venv if specified
-            venv = params.get("_venv")
-            
+            # Check if _script contains shell operators (needs bash -c)
+            if "&&" in group_executable or "||" in group_executable or "|" in group_executable:
+                # Shell command - wrap with bash -c
+                full_cmd = f"{group_executable} {' '.join(cmd_args)}"
+                cmd = ["bash", "-c", full_cmd]
+            else:
+                # Simple command - split and expand paths
+                cmd_parts = group_executable.split()
+                cmd_parts = [str(Path(p).expanduser()) if p.startswith("~") or "/" in p or "\\" in p 
+                             else p for p in cmd_parts]
+                cmd = cmd_parts + cmd_args
+
             if dry_run:
-                print(f"    Command: {' '.join(cmd)}")
-                if venv:
-                    print(f"    (venv: {venv})")
+                # For shell commands, show the bash -c with quoted argument
+                if cmd[0] == "bash" and cmd[1] == "-c":
+                    print(f"    Command: bash -c \"{cmd[2]}\"")
+                else:
+                    print(f"    Command: {' '.join(cmd)}")
                 results["cases"][case_id] = {"command": cmd, "status": "dry_run"}
 
                 # Run per-case postproc in dry-run mode
@@ -828,8 +961,11 @@ def run_sweep(toml_path: str, script: str, arg_mapping: dict = None, dry_run: bo
                     if isinstance(case_postproc, str):
                         case_postproc = [case_postproc]
                     case_postproc_json = case_dir / "q8020_case_postproc.json"
-                    run_postproc(case_postproc, case_postproc_json, script_dir, dry_run, venv)
+                    run_postproc(case_postproc, case_postproc_json, script_dir, dry_run)
                 continue
+
+            # Get _env path if specified for env snapshotting
+            env_path = params.get("_env")
 
             # Run the case via run_single()
             case_result = run_single(
@@ -840,7 +976,7 @@ def run_sweep(toml_path: str, script: str, arg_mapping: dict = None, dry_run: bo
                 case_id=case_id,
                 case_params=params,
                 timeout=3600,
-                venv=venv,
+                env_path=env_path,
             )
 
             results["cases"][experiment_id] = case_result
@@ -872,9 +1008,18 @@ def run_sweep(toml_path: str, script: str, arg_mapping: dict = None, dry_run: bo
                         json.dump(case_postproc_data, f, indent=2)
 
                 case_pp_results = run_postproc(
-                    case_postproc, case_postproc_json, script_dir, dry_run, venv
+                    case_postproc, case_postproc_json, script_dir, dry_run
                 )
                 results["cases"][experiment_id]["_case_postproc"] = case_pp_results
+
+            # Harvest all fragments into q8020_metadata_{exp_id}.json AFTER postproc
+            if not dry_run:
+                metadata_file = case_dir / f"q8020_metadata_{experiment_id}.json"
+                unified_metadata, warnings, _ = harvest_metadata(case_dir)
+                for warning in warnings:
+                    print(f"    ⚠️  {warning}", file=sys.stderr)
+                with open(metadata_file, "w", encoding="utf-8") as f:
+                    json.dump(unified_metadata, f, indent=2)
         
         # Run group postproc for this group if specified
         group_postproc = group_params.get("_group_postproc", [])
@@ -896,8 +1041,7 @@ def run_sweep(toml_path: str, script: str, arg_mapping: dict = None, dry_run: bo
                 with open(postproc_json, "w", encoding="utf-8") as f:
                     json.dump(postproc_data, f, indent=2)
             
-            group_venv = group_params.get("_venv")
-            postproc_results = run_postproc(group_postproc, postproc_json, script_dir, dry_run, group_venv)
+            postproc_results = run_postproc(group_postproc, postproc_json, script_dir, dry_run)
             results["groups"][group_id] = {"_group_postproc": postproc_results}
         
         print()
@@ -928,8 +1072,7 @@ def run_sweep(toml_path: str, script: str, arg_mapping: dict = None, dry_run: bo
                 json.dump(final_postproc_data, f, indent=2)
         
         print("=== Running final postproc ===")
-        global_venv = global_params.get("_venv")
-        final_postproc_results = run_postproc(final_postproc, final_postproc_json, script_dir, dry_run, global_venv)
+        final_postproc_results = run_postproc(final_postproc, final_postproc_json, script_dir, dry_run)
         results["_final_postproc"] = final_postproc_results
         print()
     
@@ -938,7 +1081,7 @@ def run_sweep(toml_path: str, script: str, arg_mapping: dict = None, dry_run: bo
     results["end_time"] = sweep_end_time
 
     if not dry_run:
-        results_file = run_dir / "sweep_results.json"
+        results_file = run_dir / f"q8020_sweep_meta{workflow_id}.json"
         with open(results_file, "w", encoding="utf-8") as f:
             json.dump(results, f, indent=2)
         print(f"Results saved to: {results_file}")
@@ -966,38 +1109,35 @@ Example TOML:
     shots = [1000, 2000, 4000]
 
 Usage:
-    q8020-sweeper config.toml
-    q8020-sweeper config.toml --script src/algo.py
-    q8020-sweeper config.toml --dry-run
-    q8020-sweeper config.toml --group h2_sweep
+    q8020-sweep config.toml
+    q8020-sweep config.toml --dry-run
+    q8020-sweep config.toml h2_sweep          # run only h2_sweep group
+    q8020-sweep config.toml h2_sweep li_sweep # run multiple groups
 """)
     parser.add_argument("toml_file", help="Path to TOML configuration file")
     parser.add_argument(
-        "script", nargs="?", default=None,
-        help="Python script to run (optional if TOML specifies _script)"
+        "groups", nargs="*", default=None,
+        help="Optional group name(s) to run. If omitted, runs all groups."
     )
     parser.add_argument(
         "--dry-run", action="store_true",
         help="Print commands without executing"
     )
-    parser.add_argument(
-        "--group", type=str, action="append", default=None,
-        help="Run only specified group(s). Can be repeated: --group g1 --group g2"
-    )
 
     args = parser.parse_args()
 
+    # Convert empty list to None for group_filter
+    group_filter = args.groups if args.groups else None
+
     try:
-        # If script not provided as argument, try to read from TOML
-        script = args.script
-        if script is None:
-            with open(args.toml_file, "rb") as f:
-                toml_data = tomllib.load(f)
-                script = toml_data.get("global", {}).get("_script")
-                # Allow None - groups may specify their own _script
+        # Read _script from TOML
+        with open(args.toml_file, "rb") as f:
+            toml_data = tomllib.load(f)
+            script = toml_data.get("global", toml_data.get("_global", {})).get("_script")
+            # Allow None - groups may specify their own _script
 
         results = run_sweep(
-            args.toml_file, script, dry_run=args.dry_run, group_filter=args.group
+            args.toml_file, script, dry_run=args.dry_run, group_filter=group_filter
         )
 
         # Print summary
