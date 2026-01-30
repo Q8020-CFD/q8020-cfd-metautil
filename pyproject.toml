@@ -17,9 +17,8 @@ dependencies = [
 ]
 
 [project.scripts]
-q8020-run = "q8020_cfd_metautil.util.run:main"
-q8020-sweep = "q8020_cfd_metautil.util.sweeper:main"
-q8020-sweeper = "q8020_cfd_metautil.util.sweeper:main"
+q8020-sweep = "q8020_cfd_metautil.sweep:main"
+q8020-harvest = "q8020_cfd_metautil.harvest:main"
 
 
 [tool.setuptools.packages.find]
