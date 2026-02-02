@@ -217,7 +217,7 @@ def make_code_meta(
 
 def _make_ibm_backend_meta(backend: Any) -> dict[str, Any]:
     """
-    Build backend dict for IBM/Qiskit backends.
+    Build backend dict for IBM/Qiskit AerSimulator backends.
 
     Args:
         backend: AerSimulator instance
@@ -225,7 +225,11 @@ def _make_ibm_backend_meta(backend: Any) -> dict[str, Any]:
     Returns:
         Backend dict ready for write_backend
     """
-    info: dict[str, Any] = {"name": backend.name, "vendor": "ibm"}
+    info: dict[str, Any] = {
+        "name": backend.name,
+        "vendor": "ibm",
+        "type": "simulator",
+    }
 
     options = backend.options
     info["noise"] = (
@@ -238,30 +242,117 @@ def _make_ibm_backend_meta(backend: Any) -> dict[str, Any]:
     return info
 
 
+def _make_ibm_runtime_backend_meta(backend: Any) -> dict[str, Any]:
+    """
+    Build backend dict for IBM Runtime backends (real hardware).
+
+    Args:
+        backend: IBMBackend instance from qiskit_ibm_runtime
+
+    Returns:
+        Backend dict ready for write_backend
+    """
+    target = backend.target
+
+    # Coupling map as list of edges
+    coupling_map = None
+    cm = target.build_coupling_map()
+    if cm is not None:
+        coupling_map = [list(edge) for edge in cm.get_edges()]
+
+    # Per-qubit properties
+    t1: dict[int, float] = {}
+    t2: dict[int, float] = {}
+    readout_error: dict[int, float] = {}
+
+    for qubit in range(target.num_qubits):
+        qubit_props = target.qubit_properties
+        if (
+            qubit_props
+            and qubit < len(qubit_props)
+            and qubit_props[qubit]
+        ):
+            props = qubit_props[qubit]
+            if hasattr(props, "t1") and props.t1 is not None:
+                t1[qubit] = props.t1 * 1e6
+            if hasattr(props, "t2") and props.t2 is not None:
+                t2[qubit] = props.t2 * 1e6
+
+        if "measure" in target.operation_names:
+            measure_props = target.get("measure", (qubit,))
+            if measure_props and measure_props.error is not None:
+                readout_error[qubit] = measure_props.error
+
+    # Per-gate errors
+    gate_error: dict[str, dict[str, float]] = {}
+    for gate_name in target.operation_names:
+        if gate_name == "measure":
+            continue
+        gate_error[gate_name] = {}
+        for qargs in target.qargs_for_operation_name(gate_name):
+            props = target.get(gate_name, qargs)
+            if props and props.error is not None:
+                qargs_key = ",".join(str(q) for q in qargs)
+                gate_error[gate_name][qargs_key] = props.error
+
+    return {
+        "name": backend.name,
+        "vendor": "ibm",
+        "type": "hardware",
+        "noise": True,
+        "num_qubits": target.num_qubits,
+        "coupling_map": coupling_map,
+        "basis_gates": list(target.operation_names),
+        "t1": t1 or None,
+        "t2": t2 or None,
+        "readout_error": readout_error or None,
+        "gate_error": gate_error or None,
+        "dt": target.dt,
+    }
+
+
 def make_backend_meta(backend: Any, **extras: Any) -> dict[str, Any]:
     """
     Build backend dict for any supported backend.
 
+    Supports AerSimulator (qiskit_aer) and IBMBackend
+    (qiskit_ibm_runtime). Imports are lazy so neither
+    package is a hard dependency of metautil.
+
     Args:
-        backend: A backend instance (currently supports AerSimulator)
+        backend: A backend instance (AerSimulator or IBMBackend)
         **extras: Additional backend-specific fields to include
 
     Returns:
         Backend dict ready for write_backend
 
     Raises:
-        TypeError: If backend type is not supported or qiskit_aer not installed
+        TypeError: If backend type is not supported
     """
+    # Try AerSimulator
     try:
         from qiskit_aer import AerSimulator
-    except ImportError as e:
-        raise TypeError("qiskit_aer required for make_backend_meta") from e
+        if isinstance(backend, AerSimulator):
+            info = _make_ibm_backend_meta(backend)
+            info.update(extras)
+            return info
+    except ImportError:
+        pass
 
-    if isinstance(backend, AerSimulator):
-        info = _make_ibm_backend_meta(backend)
-        info.update(extras)
-        return info
-    raise TypeError(f"Unsupported backend type: {type(backend).__name__}")
+    # Try IBM Runtime backend
+    try:
+        from qiskit_ibm_runtime import IBMBackend
+        if isinstance(backend, IBMBackend):
+            info = _make_ibm_runtime_backend_meta(backend)
+            info.update(extras)
+            return info
+    except ImportError:
+        pass
+
+    raise TypeError(
+        f"Unsupported backend type: {type(backend).__name__}. "
+        f"Install qiskit_aer or qiskit_ibm_runtime."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -298,6 +389,9 @@ def write_fragment(
             f"Unknown section '{section}'. "
             f"Valid sections: {sorted(VALID_SECTIONS)}"
         )
+
+    if "_source" not in data:
+        data["_source"] = "solver"
 
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)

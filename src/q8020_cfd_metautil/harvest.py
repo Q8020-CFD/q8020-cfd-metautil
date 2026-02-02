@@ -34,6 +34,7 @@ from q8020_cfd_metautil.meta_fragment import (
     make_user_meta,
     read_fragments,
     write_experiment,
+    write_results,
 )
 
 # Re-export patterns for use by other modules
@@ -46,11 +47,62 @@ __all__ = [
 ]
 
 
+def _extract_stdout_json(outdir: Path) -> dict[str, Any] | None:
+    """
+    Check stdout file for JSON content.
+    
+    Looks for q8020_stdout.txt or q8020_stdout_<exp_id>.txt.
+    Returns parsed JSON dict if stdout looks like JSON, else None.
+    """
+    outdir = Path(outdir)
+    
+    # Find stdout file - could be q8020_stdout.txt or q8020_stdout_<exp_id>.txt
+    stdout_file = None
+    for filepath in outdir.iterdir():
+        if filepath.is_file() and filepath.name.startswith("q8020_stdout"):
+            stdout_file = filepath
+            break
+    
+    if stdout_file is None:
+        return None
+    
+    try:
+        content = stdout_file.read_text(encoding="utf-8").strip()
+        if not content:
+            return None
+        # Try to parse as JSON
+        data = json.loads(content)
+        if isinstance(data, dict):
+            return data
+        return None
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def _next_results_index(outdir: Path) -> int:
+    """Find the next available index for results fragments."""
+    max_index = -1
+    for filepath in outdir.iterdir():
+        if not filepath.is_file():
+            continue
+        # Check both patterns for results fragments
+        for pattern in [SWEEP_FRAGMENT_PATTERN, FRAGMENT_PATTERN]:
+            match = pattern.match(filepath.name)
+            if match and match.group(1) == "results":
+                idx = int(match.group(3))
+                max_index = max(max_index, idx)
+                break
+    return max_index + 1
+
+
 def harvest_metadata(
     outdir: Path,
 ) -> tuple[dict[str, Any], list[str], dict[str, int]]:
     """
     Assemble metadata from fragment files.
+
+    Also checks q8020_stdout.txt for JSON content and writes a results fragment
+    if found (without clobbering existing results fragments).
 
     Args:
         outdir: Directory containing fragment files
@@ -58,6 +110,12 @@ def harvest_metadata(
     Returns:
         Tuple of (unified metadata dict, list of warnings, fragment counts by section)
     """
+    # Check stdout for JSON and write results fragment if found
+    stdout_json = _extract_stdout_json(outdir)
+    if stdout_json:
+        next_idx = _next_results_index(outdir)
+        write_results(outdir, {"_source": "stdout", **stdout_json}, index=next_idx)
+
     fragments = read_fragments(outdir)
     warnings: list[str] = []
     metadata: dict[str, Any] = {}

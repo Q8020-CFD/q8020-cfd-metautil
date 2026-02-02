@@ -894,10 +894,12 @@ def run_sweep(toml_path: str, script: str, arg_mapping: dict = None, dry_run: bo
         "cases": {},
     }
     
+    all_case_dirs: list[Path] = []
+
     print(f"Running sweep: {total_cases} cases in {len(groups)} groups")
     print(f"Output directory: {run_dir}")
     print()
-    
+
     # Process each group
     for group_id, group_data in groups.items():
         group_params = group_data["params"]
@@ -926,6 +928,7 @@ def run_sweep(toml_path: str, script: str, arg_mapping: dict = None, dry_run: bo
             if not dry_run:
                 case_dir.mkdir(parents=True, exist_ok=True)
             group_case_dirs.append(case_dir)
+            all_case_dirs.append(case_dir)
 
             # Build command args
             cmd_args = build_command_args(params, arg_mapping)
@@ -953,7 +956,7 @@ def run_sweep(toml_path: str, script: str, arg_mapping: dict = None, dry_run: bo
                     print(f"    Command: bash -c \"{cmd[2]}\"")
                 else:
                     print(f"    Command: {' '.join(cmd)}")
-                results["cases"][case_id] = {"command": cmd, "status": "dry_run"}
+                results["cases"][experiment_id] = {"command": cmd, "status": "dry_run"}
 
                 # Run per-case postproc in dry-run mode
                 case_postproc = params.get("_case_postproc", [])
@@ -1052,17 +1055,11 @@ def run_sweep(toml_path: str, script: str, arg_mapping: dict = None, dry_run: bo
         if isinstance(final_postproc, str):
             final_postproc = [final_postproc]
         
-        # Collect all case directories from all groups
-        all_case_dirs = []
-        for group_id, group_data in groups.items():
-            for case_id in group_data["expanded_cases"]:
-                all_case_dirs.append(str(run_dir / case_id))
-        
         # Write final_postproc JSON file
         final_postproc_data = {
             "workflow_id": workflow_id,
             "run_dir": str(run_dir),
-            "case_dirs": all_case_dirs,
+            "case_dirs": [str(d) for d in all_case_dirs],
             "groups": list(groups.keys()),
             "global_params": global_params
         }

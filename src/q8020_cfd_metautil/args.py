@@ -56,8 +56,10 @@ def add_output_args(parser: argparse.ArgumentParser) -> None:
     Args:
         parser: ArgumentParser to add arguments to
     """
-    parser.add_argument("--file", type=str, default=None,
-                        help="Write output to file (default: stdout only)")
+    #parser.add_argument("--file", type=str, default=None,
+    #                    help="Write output to file (default: stdout only)")
+    parser.add_argument("--outdir", type=str, default=None,
+                        help="Write outputs this dir")
 
 
 def add_id_args(parser: argparse.ArgumentParser) -> None:
