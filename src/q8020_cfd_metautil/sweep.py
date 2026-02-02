@@ -920,6 +920,15 @@ def run_sweep(toml_path: str, script: str, arg_mapping: dict = None, dry_run: bo
         else:
             group_executable = executable
         
+        # If _env is set, prepend venv activation to the script command
+        env_path = group_params.get("_env")
+        if env_path and group_executable:
+            env_path_resolved = Path(env_path).expanduser().resolve()
+            activate_cmd = f"source {env_path_resolved}/bin/activate"
+            # Only prepend if not already activating this venv
+            if activate_cmd not in group_executable:
+                group_executable = f"{activate_cmd} && {group_executable}"
+        
         print(f"=== Group: {group_id} ({len(expanded_cases)} cases) ===")
         
         group_case_dirs = []
