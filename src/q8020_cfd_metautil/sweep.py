@@ -634,6 +634,7 @@ def load_sweep_config(toml_path: str) -> dict:
         _output_dir = "./results"
         _script = "python src/solver.py"  # full command, can include venv activation
         _inject_outdir = "outdir"
+        _case_preproc = ["python setup_case.py"]
         _case_postproc = ["python harvester.py"]
         _group_postproc = ["python group_postproc.py"]
         _final_postproc = ["python final_postproc.py"]
@@ -704,7 +705,7 @@ def build_command_args(params: dict, arg_mapping: dict = None) -> list:
         List of command-line arguments
     """
     args = []
-    skip_keys = {"executable", "_output_dir", "_case_postproc", "_group_postproc", "_final_postproc", "_inject_outdir", "_env"}
+    skip_keys = {"executable", "_output_dir", "_case_preproc", "_case_postproc", "_group_postproc", "_final_postproc", "_inject_outdir", "_env"}
     
     for key, value in params.items():
         if key in skip_keys or key.startswith("_"):
@@ -958,6 +959,14 @@ def run_sweep(toml_path: str, script: str, arg_mapping: dict = None, dry_run: bo
                     print(f"    Command: {' '.join(cmd)}")
                 results["cases"][experiment_id] = {"command": cmd, "status": "dry_run"}
 
+                # Run per-case preproc in dry-run mode
+                case_preproc = params.get("_case_preproc", [])
+                if case_preproc:
+                    if isinstance(case_preproc, str):
+                        case_preproc = [case_preproc]
+                    case_preproc_json = case_dir / f"q8020_case_preproc_{experiment_id}.json"
+                    run_postproc(case_preproc, case_preproc_json, script_dir, dry_run)
+
                 # Run per-case postproc in dry-run mode
                 case_postproc = params.get("_case_postproc", [])
                 if case_postproc:
@@ -966,6 +975,32 @@ def run_sweep(toml_path: str, script: str, arg_mapping: dict = None, dry_run: bo
                     case_postproc_json = case_dir / f"q8020_case_postproc_{experiment_id}.json"
                     run_postproc(case_postproc, case_postproc_json, script_dir, dry_run)
                 continue
+
+            # Run per-case preproc if specified (before the main case command)
+            case_preproc = params.get("_case_preproc", [])
+            if case_preproc:
+                if isinstance(case_preproc, str):
+                    case_preproc = [case_preproc]
+
+                # Prepare case preproc data
+                case_preproc_data = {
+                    "case_id": case_id,
+                    "experiment_id": experiment_id,
+                    "workflow_id": workflow_id,
+                    "case_dir": str(case_dir),
+                    "params": params,
+                }
+                case_preproc_json = case_dir / f"q8020_case_preproc_{experiment_id}.json"
+                if not dry_run:
+                    with open(case_preproc_json, "w", encoding="utf-8") as f:
+                        json.dump(case_preproc_data, f, indent=2)
+
+                case_pre_results = run_postproc(
+                    case_preproc, case_preproc_json, script_dir, dry_run
+                )
+                if experiment_id not in results["cases"]:
+                    results["cases"][experiment_id] = {}
+                results["cases"][experiment_id]["_case_preproc"] = case_pre_results
 
             # Get _env path if specified for env snapshotting
             env_path = params.get("_env")
