@@ -851,13 +851,17 @@ def run_sweep(toml_path: str, script: str, arg_mapping: dict = None, dry_run: bo
     output_dir_str = global_params.get("_output_dir", "./sweep_results")
     output_dir = Path(output_dir_str).expanduser().resolve()
     
-    # Create output_dir if it doesn't exist
-    if not dry_run:
-        output_dir.mkdir(parents=True, exist_ok=True)
+    # Create date directory (yyyy-mm-dd) under output_dir
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    date_dir = output_dir / date_str
     
-    # Create run subdirectory with workflow ID (_ prefix)
+    # Create output_dir and date_dir if they don't exist
+    if not dry_run:
+        date_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Create run subdirectory with workflow ID under date dir
     workflow_id = generate_workflow_id()
-    run_dir = output_dir / workflow_id
+    run_dir = date_dir / workflow_id
     
     # Count total cases across all groups
     total_cases = sum(len(g["expanded_cases"]) for g in groups.values())
