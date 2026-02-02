@@ -827,6 +827,9 @@ def run_sweep(toml_path: str, script: str, arg_mapping: dict = None, dry_run: bo
         if missing:
             raise ValueError(f"Group(s) not found: {missing}. Available groups: {list(groups.keys())}")
         groups = {g: groups[g] for g in group_filter}
+    else:
+        # When no filter specified, skip groups starting with _ (they must be explicitly named)
+        groups = {g: groups[g] for g in groups if not g.startswith("_")}
     
     # Build executable command: python <script>
     # May be None if each group specifies its own _script
