@@ -764,10 +764,20 @@ def run_postproc(postproc_list: list, postproc_json: Path, script_dir: Path = No
             env['PYTHONPATH'] = str(script_dir)
     
     for postproc_cmd in postproc_list:
-        cmd = postproc_cmd.split() + [str(postproc_json)]
+        # Check if command contains shell operators (needs bash -c)
+        if "&&" in postproc_cmd or "||" in postproc_cmd or "|" in postproc_cmd or "$(" in postproc_cmd or "`" in postproc_cmd:
+            # Shell command - wrap with bash -c, append JSON path
+            full_cmd = f"{postproc_cmd} {postproc_json}"
+            cmd = ["bash", "-c", full_cmd]
+        else:
+            # Simple command - split and append JSON path
+            cmd = postproc_cmd.split() + [str(postproc_json)]
         
         if dry_run:
-            print(f"  Postproc (dry-run): {' '.join(cmd)}")
+            if cmd[0] == "bash" and cmd[1] == "-c":
+                print(f"  Postproc (dry-run): bash -c \"{cmd[2]}\"")
+            else:
+                print(f"  Postproc (dry-run): {' '.join(cmd)}")
             results.append({"command": cmd, "status": "dry_run"})
             continue
         
@@ -779,7 +789,8 @@ def run_postproc(postproc_list: list, postproc_json: Path, script_dir: Path = No
                 text=True,
                 timeout=3600,
                 check=False,
-                env=env
+                env=env,
+                shell=False
             )
             if result.returncode == 0:
                 print(f"    {GREEN}✓ Postproc completed{RESET}")
