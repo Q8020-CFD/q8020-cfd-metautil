@@ -57,6 +57,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from itertools import product
 from pathlib import Path
@@ -385,11 +386,16 @@ def run_single(
 
     cwd = os.getcwd()
 
+    # Time the pre-solver overhead (env capture, params write)
+    t_pre_start = time.perf_counter()
+
     # Capture environment snapshot before execution
     env_before = None
     if env_path:
         env_before = capture_lib_snapshot(env_path)
-        env_before_file = case_dir / f"q8020_env_before_{experiment_id}.json"
+        env_before_file = (
+            case_dir / f"q8020_env_before_{experiment_id}.json"
+        )
         with open(env_before_file, "w", encoding="utf-8") as f:
             json.dump(env_before, f, indent=2)
 
@@ -406,7 +412,10 @@ def run_single(
     if case_id is not None:
         params_data["_case_id"] = case_id
     if case_params is not None:
-        params_data.update({k: v for k, v in case_params.items() if not k.startswith("_")})
+        params_data.update(
+            {k: v for k, v in case_params.items()
+             if not k.startswith("_")}
+        )
 
     with open(params_file, "w", encoding="utf-8") as f:
         json.dump(params_data, f, indent=2)
@@ -416,6 +425,8 @@ def run_single(
         "--experiment-id", experiment_id,
         "--workflow-id", workflow_id,
     ]
+
+    t_pre_seconds = time.perf_counter() - t_pre_start
 
     # Record start time
     start_time = _get_iso_timestamp()
@@ -558,21 +569,37 @@ def run_single(
         result_dict["status"] = "exception"
         result_dict["error"] = str(e)
 
+    # Time the post-solver overhead (env_after, fragment writes)
+    t_post_start = time.perf_counter()
+
     # Capture environment snapshot after execution
     env_after = None
     if env_path:
         env_after = capture_lib_snapshot(env_path)
-        env_after_file = case_dir / f"q8020_env_after_{experiment_id}.json"
+        env_after_file = (
+            case_dir / f"q8020_env_after_{experiment_id}.json"
+        )
         with open(env_after_file, "w", encoding="utf-8") as f:
             json.dump(env_after, f, indent=2)
 
-    # Write code fragment with both env snapshots (deferred from try/except blocks)
+    # Write code fragment with both env snapshots
     code_section = _make_code_section(
         command=command_with_ids,
         env_before=env_before,
         env_after=env_after,
     )
-    write_code(case_dir, code_section, prefix="q8020_sweep", experiment_id=experiment_id)
+    write_code(
+        case_dir, code_section,
+        prefix="q8020_sweep", experiment_id=experiment_id,
+    )
+
+    t_post_seconds = time.perf_counter() - t_post_start
+
+    # Add overhead timing to result
+    result_dict["overhead"] = {
+        "pre_seconds": round(t_pre_seconds, 6),
+        "post_seconds": round(t_post_seconds, 6),
+    }
 
     return result_dict
 
@@ -1028,13 +1055,13 @@ def run_sweep(toml_path: str, script: str, arg_mapping: dict = None, dry_run: bo
                     run_postproc(case_postproc, case_postproc_json, script_dir, dry_run)
                 continue
 
-            # Run per-case preproc if specified (before the main case command)
+            # Run per-case preproc if specified
             case_preproc = params.get("_case_preproc", [])
+            t_preproc = 0.0
             if case_preproc:
                 if isinstance(case_preproc, str):
                     case_preproc = [case_preproc]
 
-                # Prepare case preproc data
                 case_preproc_data = {
                     "case_id": case_id,
                     "experiment_id": experiment_id,
@@ -1042,18 +1069,28 @@ def run_sweep(toml_path: str, script: str, arg_mapping: dict = None, dry_run: bo
                     "case_dir": str(case_dir),
                     "params": params,
                 }
-                case_preproc_json = case_dir / f"q8020_case_preproc_{experiment_id}.json"
+                case_preproc_json = (
+                    case_dir
+                    / f"q8020_case_preproc_{experiment_id}.json"
+                )
                 if not dry_run:
-                    with open(case_preproc_json, "w", encoding="utf-8") as f:
+                    with open(case_preproc_json, "w",
+                              encoding="utf-8") as f:
                         json.dump(case_preproc_data, f, indent=2)
 
+                t_pp_start = time.perf_counter()
                 case_pre_results = run_postproc(
-                    case_preproc, case_preproc_json, script_dir, dry_run,
-                    case_dir=case_dir, proc_type="preproc", experiment_id=experiment_id
+                    case_preproc, case_preproc_json,
+                    script_dir, dry_run,
+                    case_dir=case_dir, proc_type="preproc",
+                    experiment_id=experiment_id,
                 )
+                t_preproc = time.perf_counter() - t_pp_start
                 if experiment_id not in results["cases"]:
                     results["cases"][experiment_id] = {}
-                results["cases"][experiment_id]["_case_preproc"] = case_pre_results
+                results["cases"][experiment_id][
+                    "_case_preproc"
+                ] = case_pre_results
 
             # Get _env path if specified for env snapshotting
             env_path = params.get("_env")
@@ -1073,7 +1110,7 @@ def run_sweep(toml_path: str, script: str, arg_mapping: dict = None, dry_run: bo
             results["cases"][experiment_id] = case_result
 
             if case_result["status"] == "success":
-                print(f"    {GREEN}✓ Completed{RESET}")
+                print(f"    {GREEN}✓ Case completed{RESET}")
             elif case_result["status"] == "error":
                 print(f"    {RED}✗ Error (code {case_result.get('returncode')}){RESET}")
             else:
@@ -1081,11 +1118,11 @@ def run_sweep(toml_path: str, script: str, arg_mapping: dict = None, dry_run: bo
 
             # Run per-case postproc if specified
             case_postproc = params.get("_case_postproc", [])
+            t_postproc = 0.0
             if case_postproc:
                 if isinstance(case_postproc, str):
                     case_postproc = [case_postproc]
 
-                # Prepare case postproc data
                 case_postproc_data = {
                     "case_id": case_id,
                     "experiment_id": experiment_id,
@@ -1093,25 +1130,55 @@ def run_sweep(toml_path: str, script: str, arg_mapping: dict = None, dry_run: bo
                     "case_dir": str(case_dir),
                     "params": params,
                 }
-                case_postproc_json = case_dir / f"q8020_case_postproc_{experiment_id}.json"
+                case_postproc_json = (
+                    case_dir
+                    / f"q8020_case_postproc_{experiment_id}.json"
+                )
                 if not dry_run:
-                    with open(case_postproc_json, "w", encoding="utf-8") as f:
+                    with open(case_postproc_json, "w",
+                              encoding="utf-8") as f:
                         json.dump(case_postproc_data, f, indent=2)
 
+                t_pp_start = time.perf_counter()
                 case_pp_results = run_postproc(
-                    case_postproc, case_postproc_json, script_dir, dry_run,
-                    case_dir=case_dir, proc_type="postproc", experiment_id=experiment_id
+                    case_postproc, case_postproc_json,
+                    script_dir, dry_run,
+                    case_dir=case_dir, proc_type="postproc",
+                    experiment_id=experiment_id,
                 )
-                results["cases"][experiment_id]["_case_postproc"] = case_pp_results
+                t_postproc = time.perf_counter() - t_pp_start
+                results["cases"][experiment_id][
+                    "_case_postproc"
+                ] = case_pp_results
 
-            # Harvest all fragments into q8020_metadata_{exp_id}.json AFTER postproc
+            # Harvest all fragments into metadata JSON
+            t_harvest_start = time.perf_counter()
             if not dry_run:
-                metadata_file = case_dir / f"q8020_metadata_{experiment_id}.json"
-                unified_metadata, warnings, _ = harvest_metadata(case_dir)
+                metadata_file = (
+                    case_dir
+                    / f"q8020_metadata_{experiment_id}.json"
+                )
+                unified_metadata, warnings, _ = (
+                    harvest_metadata(case_dir)
+                )
                 for warning in warnings:
-                    print(f"    ⚠️  {warning}", file=sys.stderr)
-                with open(metadata_file, "w", encoding="utf-8") as f:
+                    print(
+                        f"    ⚠️  {warning}", file=sys.stderr
+                    )
+                with open(metadata_file, "w",
+                          encoding="utf-8") as f:
                     json.dump(unified_metadata, f, indent=2)
+            t_harvest = time.perf_counter() - t_harvest_start
+
+            # Merge overhead timing into case result
+            overhead = case_result.get("overhead", {})
+            overhead["preproc_seconds"] = round(t_preproc, 6)
+            overhead["postproc_seconds"] = round(
+                t_postproc, 6
+            )
+            overhead["harvest_seconds"] = round(t_harvest, 6)
+            case_result["overhead"] = overhead
+            results["cases"][experiment_id] = case_result
         
         # Run group postproc for this group if specified
         group_postproc = group_params.get("_group_postproc", [])
