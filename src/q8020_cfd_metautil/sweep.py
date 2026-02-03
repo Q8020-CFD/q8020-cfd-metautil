@@ -738,15 +738,26 @@ def build_command_args(params: dict, arg_mapping: dict = None) -> list:
     return args
 
 
-def run_postproc(postproc_list: list, postproc_json: Path, script_dir: Path = None, dry_run: bool = False) -> list:
+def run_postproc(
+    postproc_list: list,
+    postproc_json: Path,
+    script_dir: Path = None,
+    dry_run: bool = False,
+    case_dir: Path = None,
+    proc_type: str = "postproc",
+    experiment_id: str = None,
+) -> list:
     """
-    Run postprocessing scripts with a JSON file as the single argument.
+    Run pre/postprocessing scripts with a JSON file as the single argument.
     
     Args:
         postproc_list: List of postproc commands (e.g., ["python analyze.py", "python plot.py --verbose"])
         postproc_json: Path to JSON file containing postproc context
         script_dir: Directory containing the script (added to PYTHONPATH for module imports)
         dry_run: If True, print commands without executing
+        case_dir: Directory to write stdout/stderr files (optional)
+        proc_type: "preproc" or "postproc" for file naming
+        experiment_id: Experiment ID for file naming
     
     Returns:
         List of results for each postproc command
@@ -766,11 +777,10 @@ def run_postproc(postproc_list: list, postproc_json: Path, script_dir: Path = No
     for postproc_cmd in postproc_list:
         # Check if command contains shell operators (needs bash -c)
         if "&&" in postproc_cmd or "||" in postproc_cmd or "|" in postproc_cmd or "$(" in postproc_cmd or "`" in postproc_cmd:
-            # Shell command - wrap with bash -c, append JSON path
-            full_cmd = f"{postproc_cmd} {postproc_json}"
-            cmd = ["bash", "-c", full_cmd]
+            # Shell command - wrap with bash -c, run as-is (no JSON path appended)
+            cmd = ["bash", "-c", postproc_cmd]
         else:
-            # Simple command - split and append JSON path
+            # Simple command - split and append JSON path as argument
             cmd = postproc_cmd.split() + [str(postproc_json)]
         
         if dry_run:
@@ -800,6 +810,18 @@ def run_postproc(postproc_list: list, postproc_json: Path, script_dir: Path = No
                 print(f"    {RED}✗ Postproc error (code {result.returncode}){RESET}")
                 if result.stderr:
                     print(f"      {result.stderr[:200]}")
+            
+            # Write stdout/stderr to files if case_dir provided
+            if case_dir and experiment_id:
+                if result.stdout:
+                    stdout_file = case_dir / f"q8020_{proc_type}_stdout_{experiment_id}.txt"
+                    with open(stdout_file, "w", encoding="utf-8") as f:
+                        f.write(result.stdout)
+                if result.stderr:
+                    stderr_file = case_dir / f"q8020_{proc_type}_stderr_{experiment_id}.txt"
+                    with open(stderr_file, "w", encoding="utf-8") as f:
+                        f.write(result.stderr)
+            
             results.append({
                 "command": cmd,
                 "status": "success" if result.returncode == 0 else "error",
@@ -1023,7 +1045,8 @@ def run_sweep(toml_path: str, script: str, arg_mapping: dict = None, dry_run: bo
                         json.dump(case_preproc_data, f, indent=2)
 
                 case_pre_results = run_postproc(
-                    case_preproc, case_preproc_json, script_dir, dry_run
+                    case_preproc, case_preproc_json, script_dir, dry_run,
+                    case_dir=case_dir, proc_type="preproc", experiment_id=experiment_id
                 )
                 if experiment_id not in results["cases"]:
                     results["cases"][experiment_id] = {}
@@ -1073,7 +1096,8 @@ def run_sweep(toml_path: str, script: str, arg_mapping: dict = None, dry_run: bo
                         json.dump(case_postproc_data, f, indent=2)
 
                 case_pp_results = run_postproc(
-                    case_postproc, case_postproc_json, script_dir, dry_run
+                    case_postproc, case_postproc_json, script_dir, dry_run,
+                    case_dir=case_dir, proc_type="postproc", experiment_id=experiment_id
                 )
                 results["cases"][experiment_id]["_case_postproc"] = case_pp_results
 
