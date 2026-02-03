@@ -783,15 +783,18 @@ def run_postproc(
             # Simple command - split and append JSON path as argument
             cmd = postproc_cmd.split() + [str(postproc_json)]
         
+        # Capitalize proc_type for display
+        proc_label = proc_type.capitalize()
+        
         if dry_run:
             if cmd[0] == "bash" and cmd[1] == "-c":
-                print(f"  Postproc (dry-run): bash -c \"{cmd[2]}\"")
+                print(f"  {proc_label} (dry-run): bash -c \"{cmd[2]}\"")
             else:
-                print(f"  Postproc (dry-run): {' '.join(cmd)}")
+                print(f"  {proc_label} (dry-run): {' '.join(cmd)}")
             results.append({"command": cmd, "status": "dry_run"})
             continue
         
-        print(f"  Running postproc: {postproc_cmd}")
+        print(f"  Running {proc_type}: {postproc_cmd}")
         try:
             result = subprocess.run(
                 cmd,
