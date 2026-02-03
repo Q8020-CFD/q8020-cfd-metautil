@@ -806,11 +806,11 @@ def run_postproc(
                 shell=False
             )
             if result.returncode == 0:
-                print(f"    {GREEN}✓ Postproc completed{RESET}")
+                print(f"    {GREEN}✓ {proc_label} completed{RESET}")
                 if result.stdout:
                     print(result.stdout)
             else:
-                print(f"    {RED}✗ Postproc error (code {result.returncode}){RESET}")
+                print(f"    {RED}✗ {proc_label} error (code {result.returncode}){RESET}")
                 if result.stderr:
                     print(f"      {result.stderr[:200]}")
             
@@ -833,7 +833,7 @@ def run_postproc(
                 "stderr": result.stderr[:500] if result.stderr else ""
             })
         except Exception as e:
-            print(f"    {RED}✗ Postproc exception: {e}{RESET}")
+            print(f"    {RED}✗ {proc_label} exception: {e}{RESET}")
             results.append({"command": cmd, "status": "exception", "error": str(e)})
     
     return results
