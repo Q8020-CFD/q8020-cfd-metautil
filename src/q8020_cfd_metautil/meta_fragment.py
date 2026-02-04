@@ -219,11 +219,9 @@ def _make_ibm_backend_meta(backend: Any) -> dict[str, Any]:
     """
     Build backend dict for IBM/Qiskit AerSimulator backends.
 
-    Args:
-        backend: AerSimulator instance
-
-    Returns:
-        Backend dict ready for write_backend
+    Extracts noise model details (T1, T2, gate errors, readout
+    errors) when the simulator was constructed from a fake or
+    real backend via AerSimulator.from_backend().
     """
     info: dict[str, Any] = {
         "name": backend.name,
@@ -232,14 +230,107 @@ def _make_ibm_backend_meta(backend: Any) -> dict[str, Any]:
     }
 
     options = backend.options
-    info["noise"] = (
-        hasattr(options, "noise_model") and options.noise_model is not None
+    has_noise = (
+        hasattr(options, "noise_model")
+        and options.noise_model is not None
     )
+    info["noise"] = has_noise
 
-    if hasattr(options, "coupling_map") and options.coupling_map is not None:
-        info["coupling_map"] = options.coupling_map
+    # Num qubits
+    if hasattr(backend, "num_qubits"):
+        info["num_qubits"] = backend.num_qubits
+
+    # Coupling map: try configuration() first, then options
+    try:
+        cfg = backend.configuration()
+        cm = getattr(cfg, "coupling_map", None)
+        if cm is not None:
+            info["coupling_map"] = [list(e) for e in cm]
+    except Exception:
+        pass
+    if "coupling_map" not in info:
+        cm = getattr(options, "coupling_map", None)
+        if cm is not None:
+            if hasattr(cm, "get_edges"):
+                info["coupling_map"] = [
+                    list(e) for e in cm.get_edges()
+                ]
+            else:
+                info["coupling_map"] = cm
+
+    # Basis gates: prefer noise model (real hw gates) over
+    # configuration (includes all simulator builtins).
+    if has_noise:
+        noise_model = options.noise_model
+        bg = getattr(noise_model, "basis_gates", None)
+        if bg:
+            info["basis_gates"] = list(bg)
+    if "basis_gates" not in info:
+        bg = getattr(options, "basis_gates", None)
+        if bg is not None:
+            info["basis_gates"] = list(bg)
+    if "basis_gates" not in info:
+        try:
+            cfg = backend.configuration()
+            bg = getattr(cfg, "basis_gates", None)
+            if bg is not None:
+                info["basis_gates"] = list(bg)
+        except Exception:
+            pass
+
+    # Extract noise model details (errors per qubit/gate)
+    if has_noise:
+        _extract_noise_model_details(info, noise_model)
 
     return info
+
+
+def _extract_noise_model_details(
+    info: dict[str, Any],
+    noise_model: Any,
+) -> None:
+    """Extract T1, T2, gate errors, readout errors from noise model."""
+    try:
+        nm_dict = noise_model.to_dict()
+        readout_errors: dict[int, list[float]] = {}
+        gate_error_summary: dict[str, dict[str, float]] = {}
+
+        for entry in nm_dict.get("errors", []):
+            etype = entry.get("type", "")
+            gate_qubits = entry.get("gate_qubits", [])
+            qubits = gate_qubits[0] if gate_qubits else ()
+            ops = entry.get("operations", [])
+            gate = ops[0] if ops else ""
+
+            if etype == "roerror" and len(qubits) == 1:
+                probs = entry.get("probabilities", [])
+                if len(probs) >= 2:
+                    readout_errors[qubits[0]] = [
+                        float(probs[0][1])
+                        if len(probs[0]) > 1 else 0.0,
+                        float(probs[1][0])
+                        if len(probs[1]) > 0 else 0.0,
+                    ]
+
+            if etype == "qerror" and gate:
+                qargs_key = ",".join(
+                    str(q) for q in qubits
+                )
+                if gate not in gate_error_summary:
+                    gate_error_summary[gate] = {}
+                probs = entry.get("probabilities", [])
+                if probs and len(probs) > 1:
+                    gate_error_summary[gate][
+                        qargs_key
+                    ] = round(1.0 - float(probs[0]), 8)
+
+        if readout_errors:
+            info["readout_error"] = readout_errors
+        if gate_error_summary:
+            info["gate_error"] = gate_error_summary
+    except Exception:
+        # Noise model extraction is best-effort
+        pass
 
 
 def _make_ibm_runtime_backend_meta(backend: Any) -> dict[str, Any]:
