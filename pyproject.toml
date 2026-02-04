@@ -13,7 +13,8 @@ dependencies = [
     "duckdb",
     "streamlit",
     "plotly",
-    "watchdog"
+    "watchdog",
+    "subprocess-tee"
 ]
 
 [project.scripts]

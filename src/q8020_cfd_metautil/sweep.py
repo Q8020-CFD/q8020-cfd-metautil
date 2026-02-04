@@ -58,6 +58,8 @@ import shutil
 import subprocess
 import sys
 import time
+
+import subprocess_tee
 from datetime import datetime, timezone
 from itertools import product
 from pathlib import Path
@@ -441,11 +443,9 @@ def run_single(
     }
 
     try:
-        # Run the command, capturing stdout and stderr
-        result = subprocess.run(
+        # Run the command, capturing stdout and stderr while also echoing to console
+        result = subprocess_tee.run(
             command_with_ids,
-            capture_output=True,
-            text=True,
             check=False,
             timeout=timeout,
         )
@@ -823,23 +823,16 @@ def run_postproc(
         
         print(f"  Running {proc_type}: {postproc_cmd}")
         try:
-            result = subprocess.run(
+            result = subprocess_tee.run(
                 cmd,
-                capture_output=True,
-                text=True,
                 timeout=3600,
                 check=False,
                 env=env,
-                shell=False
             )
             if result.returncode == 0:
                 print(f"    {GREEN}✓ {proc_label} completed{RESET}")
-                if result.stdout:
-                    print(result.stdout)
             else:
                 print(f"    {RED}✗ {proc_label} error (code {result.returncode}){RESET}")
-                if result.stderr:
-                    print(f"      {result.stderr[:200]}")
             
             # Write stdout/stderr to files if case_dir provided
             if case_dir and experiment_id:
