@@ -83,6 +83,10 @@ from q8020_cfd_metautil.meta_fragment import (
 # ANSI color codes
 GREEN = '\033[92m'
 RED = '\033[91m'
+YELLOW = '\033[93m'
+CYAN = '\033[96m'
+BOLD = '\033[1m'
+DIM = '\033[2m'
 RESET = '\033[0m'
 
 
@@ -392,14 +396,21 @@ def run_single(
     t_pre_start = time.perf_counter()
 
     # Capture environment snapshot before execution
-    env_before = None
+    # Always capture library versions for reproducibility
     if env_path:
         env_before = capture_lib_snapshot(env_path)
-        env_before_file = (
-            case_dir / f"q8020_env_before_{experiment_id}.json"
-        )
-        with open(env_before_file, "w", encoding="utf-8") as f:
-            json.dump(env_before, f, indent=2)
+    else:
+        # No explicit env_path - capture from current process environment
+        env_before = {
+            "type": "current_process",
+            "packages": make_library_meta(),
+            "timestamp": _get_iso_timestamp(),
+        }
+    env_before_file = (
+        case_dir / f"q8020_env_before_{experiment_id}.json"
+    )
+    with open(env_before_file, "w", encoding="utf-8") as f:
+        json.dump(env_before, f, indent=2)
 
     # Build params.json content
     params_data: dict[str, Any] = {
@@ -573,14 +584,21 @@ def run_single(
     t_post_start = time.perf_counter()
 
     # Capture environment snapshot after execution
-    env_after = None
+    # Always capture library versions for reproducibility
     if env_path:
         env_after = capture_lib_snapshot(env_path)
-        env_after_file = (
-            case_dir / f"q8020_env_after_{experiment_id}.json"
-        )
-        with open(env_after_file, "w", encoding="utf-8") as f:
-            json.dump(env_after, f, indent=2)
+    else:
+        # No explicit env_path - capture from current process environment
+        env_after = {
+            "type": "current_process",
+            "packages": make_library_meta(),
+            "timestamp": _get_iso_timestamp(),
+        }
+    env_after_file = (
+        case_dir / f"q8020_env_after_{experiment_id}.json"
+    )
+    with open(env_after_file, "w", encoding="utf-8") as f:
+        json.dump(env_after, f, indent=2)
 
     # Write code fragment with both env snapshots
     code_section = _make_code_section(
@@ -821,7 +839,7 @@ def run_postproc(
             results.append({"command": cmd, "status": "dry_run"})
             continue
         
-        print(f"  Running {proc_type}: {postproc_cmd}")
+        print(f"  {YELLOW}Running {proc_type}:{RESET} {DIM}{postproc_cmd}{RESET}")
         try:
             result = subprocess_tee.run(
                 cmd,
@@ -830,9 +848,9 @@ def run_postproc(
                 env=env,
             )
             if result.returncode == 0:
-                print(f"    {GREEN}✓ {proc_label} completed{RESET}")
+                print(f"    {GREEN}{BOLD}✓ {proc_label} completed{RESET}")
             else:
-                print(f"    {RED}✗ {proc_label} error (code {result.returncode}){RESET}")
+                print(f"    {RED}{BOLD}✗ {proc_label} error (code {result.returncode}){RESET}")
             
             # Write stdout/stderr to files if case_dir provided
             if case_dir and experiment_id:
@@ -853,7 +871,7 @@ def run_postproc(
                 "stderr": result.stderr[:500] if result.stderr else ""
             })
         except Exception as e:
-            print(f"    {RED}✗ {proc_label} exception: {e}{RESET}")
+            print(f"    {RED}{BOLD}✗ {proc_label} exception:{RESET} {e}")
             results.append({"command": cmd, "status": "exception", "error": str(e)})
     
     return results
@@ -960,8 +978,8 @@ def run_sweep(toml_path: str, script: str, arg_mapping: dict = None, dry_run: bo
     
     all_case_dirs: list[Path] = []
 
-    print(f"Running sweep: {total_cases} cases in {len(groups)} groups")
-    print(f"Output directory: {run_dir}")
+    print(f"{CYAN}{BOLD}Running sweep:{RESET} {total_cases} cases in {len(groups)} groups")
+    print(f"{CYAN}{BOLD}Output directory:{RESET} {run_dir}")
     print()
 
     # Process each group
@@ -985,13 +1003,13 @@ def run_sweep(toml_path: str, script: str, arg_mapping: dict = None, dry_run: bo
             if activate_cmd not in group_executable:
                 group_executable = f"{activate_cmd} && {group_executable}"
         
-        print(f"=== Group: {group_id} ({len(expanded_cases)} cases) ===")
+        print(f"{CYAN}{BOLD}=== Group: {group_id} ({len(expanded_cases)} cases) ==={RESET}")
         
         group_case_dirs = []
         
         # Run each expanded case in the group
         for case_id, params in expanded_cases.items():
-            print(f"  Case: {case_id}")
+            print(f"  {YELLOW}Case:{RESET} {case_id}")
             
             # Generate experiment_id for this case
             experiment_id = generate_experiment_id()
@@ -1103,11 +1121,11 @@ def run_sweep(toml_path: str, script: str, arg_mapping: dict = None, dry_run: bo
             results["cases"][experiment_id] = case_result
 
             if case_result["status"] == "success":
-                print(f"    {GREEN}✓ Case completed{RESET}")
+                print(f"    {GREEN}{BOLD}✓ Case completed{RESET}")
             elif case_result["status"] == "error":
-                print(f"    {RED}✗ Error (code {case_result.get('returncode')}){RESET}")
+                print(f"    {RED}{BOLD}✗ Error (code {case_result.get('returncode')}){RESET}")
             else:
-                print(f"    {RED}✗ {case_result['status']}{RESET}")
+                print(f"    {RED}{BOLD}✗ {case_result['status']}{RESET}")
 
             # Run per-case postproc if specified
             case_postproc = params.get("_case_postproc", [])
@@ -1217,7 +1235,7 @@ def run_sweep(toml_path: str, script: str, arg_mapping: dict = None, dry_run: bo
             with open(final_postproc_json, "w", encoding="utf-8") as f:
                 json.dump(final_postproc_data, f, indent=2)
         
-        print("=== Running final postproc ===")
+        print(f"{CYAN}{BOLD}=== Running final postproc ==={RESET}")
         final_postproc_results = run_postproc(final_postproc, final_postproc_json, script_dir, dry_run)
         results["_final_postproc"] = final_postproc_results
         print()
@@ -1230,7 +1248,7 @@ def run_sweep(toml_path: str, script: str, arg_mapping: dict = None, dry_run: bo
         results_file = run_dir / f"q8020_sweep_meta{workflow_id}.json"
         with open(results_file, "w", encoding="utf-8") as f:
             json.dump(results, f, indent=2)
-        print(f"Results saved to: {results_file}")
+        print(f"{CYAN}{BOLD}Results saved to:{RESET} {results_file}")
 
     return results
 
@@ -1287,12 +1305,14 @@ Usage:
         )
 
         # Print summary
-        print("\n=== Summary ===")
+        print(f"\n{CYAN}{BOLD}=== Summary ==={RESET}")
         total = len(results["cases"])
         success = sum(
             1 for c in results["cases"].values() if c.get("status") == "success"
         )
-        print(f"Total: {total}, Success: {success}, Failed: {total - success}")
+        failed = total - success
+        failed_str = f"{RED}{BOLD}Failed:{RESET} {failed}" if failed > 0 else f"Failed: {failed}"
+        print(f"{BOLD}Total:{RESET} {total}, {GREEN}{BOLD}Success:{RESET} {success}, {failed_str}")
 
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
