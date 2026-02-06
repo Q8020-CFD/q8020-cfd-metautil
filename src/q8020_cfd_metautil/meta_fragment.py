@@ -282,6 +282,29 @@ def _make_ibm_backend_meta(backend: Any) -> dict[str, Any]:
     if has_noise:
         _extract_noise_model_details(info, noise_model)
 
+    # Extract per-qubit T1/T2 and dt from target (available when
+    # simulator was built via AerSimulator.from_backend()).
+    target = getattr(backend, "target", None)
+    if target is not None:
+        qubit_props = getattr(target, "qubit_properties", None)
+        if qubit_props:
+            t1: dict[int, float] = {}
+            t2: dict[int, float] = {}
+            for qubit in range(target.num_qubits):
+                if qubit < len(qubit_props) and qubit_props[qubit]:
+                    props = qubit_props[qubit]
+                    if hasattr(props, "t1") and props.t1 is not None:
+                        t1[qubit] = props.t1 * 1e6  # seconds -> µs
+                    if hasattr(props, "t2") and props.t2 is not None:
+                        t2[qubit] = props.t2 * 1e6
+            if t1:
+                info["t1"] = t1
+            if t2:
+                info["t2"] = t2
+        dt = getattr(target, "dt", None)
+        if dt is not None:
+            info["dt"] = dt
+
     return info
 
 
