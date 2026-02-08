@@ -356,6 +356,13 @@ def _extract_noise_model_details(
         pass
 
 
+def _get_prop(props: Any, key: str) -> Any:
+    """Extract a property from an InstructionProperties or dict."""
+    if isinstance(props, dict):
+        return props.get(key)
+    return getattr(props, key, None)
+
+
 def _make_ibm_runtime_backend_meta(backend: Any) -> dict[str, Any]:
     """
     Build backend dict for IBM Runtime backends (real hardware).
@@ -387,15 +394,19 @@ def _make_ibm_runtime_backend_meta(backend: Any) -> dict[str, Any]:
             and qubit_props[qubit]
         ):
             props = qubit_props[qubit]
-            if hasattr(props, "t1") and props.t1 is not None:
-                t1[qubit] = props.t1 * 1e6
-            if hasattr(props, "t2") and props.t2 is not None:
-                t2[qubit] = props.t2 * 1e6
+            t1_val = _get_prop(props, "t1")
+            if t1_val is not None:
+                t1[qubit] = t1_val * 1e6
+            t2_val = _get_prop(props, "t2")
+            if t2_val is not None:
+                t2[qubit] = t2_val * 1e6
 
         if "measure" in target.operation_names:
             measure_props = target.get("measure", (qubit,))
-            if measure_props and measure_props.error is not None:
-                readout_error[qubit] = measure_props.error
+            if measure_props:
+                err = _get_prop(measure_props, "error")
+                if err is not None:
+                    readout_error[qubit] = err
 
     # Per-gate errors
     gate_error: dict[str, dict[str, float]] = {}
@@ -403,11 +414,13 @@ def _make_ibm_runtime_backend_meta(backend: Any) -> dict[str, Any]:
         if gate_name == "measure":
             continue
         gate_error[gate_name] = {}
-        for qargs in target.qargs_for_operation_name(gate_name):
+        for qargs in (target.qargs_for_operation_name(gate_name) or []):
             props = target.get(gate_name, qargs)
-            if props and props.error is not None:
-                qargs_key = ",".join(str(q) for q in qargs)
-                gate_error[gate_name][qargs_key] = props.error
+            if props:
+                err = _get_prop(props, "error")
+                if err is not None:
+                    qargs_key = ",".join(str(q) for q in qargs)
+                    gate_error[gate_name][qargs_key] = err
 
     return {
         "name": backend.name,
@@ -448,6 +461,7 @@ def make_backend_meta(backend: Any, **extras: Any) -> dict[str, Any]:
         from qiskit_aer import AerSimulator
         if isinstance(backend, AerSimulator):
             info = _make_ibm_backend_meta(backend)
+            info["captured_at"] = datetime.now(timezone.utc).isoformat()
             info.update(extras)
             return info
     except ImportError:
@@ -458,6 +472,7 @@ def make_backend_meta(backend: Any, **extras: Any) -> dict[str, Any]:
         from qiskit_ibm_runtime import IBMBackend
         if isinstance(backend, IBMBackend):
             info = _make_ibm_runtime_backend_meta(backend)
+            info["captured_at"] = datetime.now(timezone.utc).isoformat()
             info.update(extras)
             return info
     except ImportError:
