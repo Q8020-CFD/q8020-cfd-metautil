@@ -623,6 +623,678 @@ def run_single(
 
 
 # ---------------------------------------------------------------------------
+# Parallel execution support
+# ---------------------------------------------------------------------------
+
+def run_case_pipeline(
+    cmd: list[str],
+    case_dir: Path,
+    experiment_id: str,
+    workflow_id: str,
+    case_id: str,
+    case_params: dict[str, Any],
+    env_path: str | None,
+    script_dir: Path,
+    case_preproc: list[str],
+    case_postproc: list[str],
+) -> dict[str, Any]:
+    """Run the full per-case pipeline: preproc, solver, postproc, harvest.
+
+    Used by sweep_worker.py for parallel execution. Each parallel
+    subprocess calls this to run one case end-to-end.
+    """
+    case_dir = Path(case_dir)
+    script_dir = Path(script_dir)
+    result: dict[str, Any] = {
+        "case_id": case_id,
+        "experiment_id": experiment_id,
+    }
+
+    # --- preproc ---
+    t_preproc = 0.0
+    if case_preproc:
+        preproc_data = {
+            "case_id": case_id,
+            "experiment_id": experiment_id,
+            "workflow_id": workflow_id,
+            "case_dir": str(case_dir),
+            "params": case_params,
+        }
+        preproc_json = (
+            case_dir / f"q8020_case_preproc_{experiment_id}.json"
+        )
+        with open(preproc_json, "w", encoding="utf-8") as f:
+            json.dump(preproc_data, f, indent=2)
+        t_pp_start = time.perf_counter()
+        pre_results = run_postproc(
+            case_preproc, preproc_json, script_dir,
+            dry_run=False, case_dir=case_dir,
+            proc_type="preproc", experiment_id=experiment_id,
+        )
+        t_preproc = time.perf_counter() - t_pp_start
+        result["_case_preproc"] = pre_results
+
+    # --- solver (subprocess.run, file-based output) ---
+    cwd = os.getcwd()
+    stderr_file = case_dir / f"q8020_stderr_{experiment_id}.txt"
+    stdout_file = case_dir / f"q8020_stdout_{experiment_id}.txt"
+    params_file = case_dir / f"q8020_params_{experiment_id}.json"
+
+    # env snapshot before
+    t_pre_start = time.perf_counter()
+    if env_path:
+        env_before = capture_lib_snapshot(env_path)
+    else:
+        env_before = {
+            "type": "current_process",
+            "packages": make_library_meta(),
+            "timestamp": _get_iso_timestamp(),
+        }
+    env_before_file = (
+        case_dir / f"q8020_env_before_{experiment_id}.json"
+    )
+    with open(env_before_file, "w", encoding="utf-8") as f:
+        json.dump(env_before, f, indent=2)
+
+    # params file
+    params_data: dict[str, Any] = {
+        "command": cmd,
+        "script": cmd[1] if len(cmd) > 1 else None,
+        "args": cmd[2:] if len(cmd) > 2 else [],
+        "workflow_id": workflow_id,
+        "experiment_id": experiment_id,
+        "timestamp": datetime.now().isoformat(),
+        "cwd": cwd,
+        "_case_id": case_id,
+    }
+    params_data.update(
+        {k: v for k, v in case_params.items()
+         if not k.startswith("_")}
+    )
+    with open(params_file, "w", encoding="utf-8") as f:
+        json.dump(params_data, f, indent=2)
+
+    # append IDs to command
+    command_with_ids = cmd + [
+        "--experiment-id", experiment_id,
+        "--workflow-id", workflow_id,
+    ]
+    t_pre_seconds = time.perf_counter() - t_pre_start
+
+    start_time = _get_iso_timestamp()
+    start_dt = datetime.now(timezone.utc)
+
+    try:
+        with open(stdout_file, "w", encoding="utf-8") as fout, \
+             open(stderr_file, "w", encoding="utf-8") as ferr:
+            proc_result = subprocess.run(
+                command_with_ids,
+                stdout=fout,
+                stderr=ferr,
+                check=False,
+                timeout=3600,
+            )
+        returncode = proc_result.returncode
+        end_time = _get_iso_timestamp()
+        end_dt = datetime.now(timezone.utc)
+        duration = (end_dt - start_dt).total_seconds()
+
+        exec_stats: dict[str, Any] = {
+            "_source": "sweep",
+            "start_time": start_time,
+            "end_time": end_time,
+            "duration_seconds": duration,
+            "exit_code": returncode,
+            "success": returncode == 0,
+        }
+        result["status"] = (
+            "success" if returncode == 0 else "error"
+        )
+        result["returncode"] = returncode
+
+    except subprocess.TimeoutExpired:
+        end_time = _get_iso_timestamp()
+        end_dt = datetime.now(timezone.utc)
+        duration = (end_dt - start_dt).total_seconds()
+        exec_stats = {
+            "_source": "sweep",
+            "start_time": start_time,
+            "end_time": end_time,
+            "duration_seconds": duration,
+            "exit_code": None,
+            "success": False,
+            "error": "timeout",
+        }
+        result["status"] = "timeout"
+
+    except Exception as e:
+        end_time = _get_iso_timestamp()
+        end_dt = datetime.now(timezone.utc)
+        duration = (end_dt - start_dt).total_seconds()
+        exec_stats = {
+            "_source": "sweep",
+            "start_time": start_time,
+            "end_time": end_time,
+            "duration_seconds": duration,
+            "exit_code": None,
+            "success": False,
+            "error": str(e),
+        }
+        result["status"] = "exception"
+        result["error"] = str(e)
+
+    # write metadata fragments
+    experiment_name = case_id or _derive_experiment_name(cmd)
+    experiment_section = _make_experiment_section(
+        name=experiment_name,
+        experiment_id=experiment_id,
+        workflow_id=workflow_id,
+        timestamp=start_time,
+    )
+    case_section = _make_case_section(
+        command=command_with_ids, cwd=cwd,
+        case_id=case_id, case_params=case_params,
+    )
+    artifacts_section = _inventory_artifacts(case_dir)
+
+    write_experiment(
+        case_dir, experiment_section,
+        prefix="q8020_sweep", experiment_id=experiment_id,
+    )
+    write_case(
+        case_dir, case_section,
+        prefix="q8020_sweep", experiment_id=experiment_id,
+    )
+    write_exec_stats(
+        case_dir, exec_stats,
+        prefix="q8020_sweep", experiment_id=experiment_id,
+    )
+    write_artifacts(
+        case_dir, artifacts_section,
+        prefix="q8020_sweep", experiment_id=experiment_id,
+    )
+
+    # env snapshot after
+    t_post_start = time.perf_counter()
+    if env_path:
+        env_after = capture_lib_snapshot(env_path)
+    else:
+        env_after = {
+            "type": "current_process",
+            "packages": make_library_meta(),
+            "timestamp": _get_iso_timestamp(),
+        }
+    env_after_file = (
+        case_dir / f"q8020_env_after_{experiment_id}.json"
+    )
+    with open(env_after_file, "w", encoding="utf-8") as f:
+        json.dump(env_after, f, indent=2)
+
+    code_section = _make_code_section(
+        command=command_with_ids,
+        env_before=env_before,
+        env_after=env_after,
+    )
+    write_code(
+        case_dir, code_section,
+        prefix="q8020_sweep", experiment_id=experiment_id,
+    )
+    t_post_seconds = time.perf_counter() - t_post_start
+
+    # --- postproc ---
+    t_postproc = 0.0
+    if case_postproc:
+        postproc_data = {
+            "case_id": case_id,
+            "experiment_id": experiment_id,
+            "workflow_id": workflow_id,
+            "case_dir": str(case_dir),
+            "params": case_params,
+        }
+        postproc_json = (
+            case_dir / f"q8020_case_postproc_{experiment_id}.json"
+        )
+        with open(postproc_json, "w", encoding="utf-8") as f:
+            json.dump(postproc_data, f, indent=2)
+        t_pp_start = time.perf_counter()
+        pp_results = run_postproc(
+            case_postproc, postproc_json, script_dir,
+            dry_run=False, case_dir=case_dir,
+            proc_type="postproc", experiment_id=experiment_id,
+        )
+        t_postproc = time.perf_counter() - t_pp_start
+        result["_case_postproc"] = pp_results
+
+    # --- harvest ---
+    t_harvest_start = time.perf_counter()
+    metadata_file = (
+        case_dir / f"q8020_metadata_{experiment_id}.json"
+    )
+    unified_metadata, warnings, _ = harvest_metadata(case_dir)
+    for warning in warnings:
+        print(f"  warning: {warning}", file=sys.stderr)
+    with open(metadata_file, "w", encoding="utf-8") as f:
+        json.dump(unified_metadata, f, indent=2)
+    t_harvest = time.perf_counter() - t_harvest_start
+
+    result["output_dir"] = str(case_dir)
+    result["command"] = command_with_ids
+    result["overhead"] = {
+        "pre_seconds": round(t_pre_seconds, 6),
+        "post_seconds": round(t_post_seconds, 6),
+        "preproc_seconds": round(t_preproc, 6),
+        "postproc_seconds": round(t_postproc, 6),
+        "harvest_seconds": round(t_harvest, 6),
+    }
+
+    return result
+
+
+def _build_case_launch_info(
+    case_id: str,
+    params: dict[str, Any],
+    run_dir: Path,
+    workflow_id: str,
+    group_executable: str,
+    script_dir: Path,
+) -> dict[str, Any]:
+    """Build launch info for a single case (shared by local and SLURM).
+
+    Returns dict with experiment_id, case_dir, cmd, pipeline_args,
+    and the path to the serialized args file.
+    """
+    experiment_id = generate_experiment_id()
+    case_dir = run_dir / experiment_id
+    case_dir.mkdir(parents=True, exist_ok=True)
+
+    # Build solver command (same logic as run_sweep sequential path)
+    cmd_args = build_command_args(params)
+    inject_outdir = params.get("_inject_outdir")
+    if inject_outdir:
+        cmd_args.extend([inject_outdir, str(case_dir)])
+
+    if ("&&" in group_executable
+            or "||" in group_executable
+            or "|" in group_executable):
+        full_cmd = f"{group_executable} {' '.join(cmd_args)}"
+        cmd = ["bash", "-c", full_cmd]
+    else:
+        cmd_parts = group_executable.split()
+        cmd_parts = [
+            str(Path(p).expanduser())
+            if p.startswith("~") or "/" in p or "\\" in p
+            else p
+            for p in cmd_parts
+        ]
+        cmd = cmd_parts + cmd_args
+
+    env_path = params.get("_env")
+    case_preproc = params.get("_case_preproc", [])
+    if isinstance(case_preproc, str):
+        case_preproc = [case_preproc]
+    case_postproc = params.get("_case_postproc", [])
+    if isinstance(case_postproc, str):
+        case_postproc = [case_postproc]
+
+    pipeline_args = {
+        "cmd": cmd,
+        "case_dir": str(case_dir),
+        "experiment_id": experiment_id,
+        "workflow_id": workflow_id,
+        "case_id": case_id,
+        "case_params": params,
+        "env_path": env_path,
+        "script_dir": str(script_dir),
+        "case_preproc": case_preproc,
+        "case_postproc": case_postproc,
+    }
+
+    args_file = case_dir / "pipeline_args.json"
+    with open(args_file, "w", encoding="utf-8") as f:
+        json.dump(pipeline_args, f, indent=2)
+
+    return {
+        "experiment_id": experiment_id,
+        "case_id": case_id,
+        "case_dir": case_dir,
+        "cmd": cmd,
+        "args_file": args_file,
+        "params": params,
+    }
+
+
+def _finalize_local_parallel(
+    all_cases_info: list[dict[str, Any]],
+    all_results: dict[str, Any],
+    global_params: dict[str, Any],
+    dry_run: bool = False,
+) -> None:
+    """Launch all collected cases concurrently via local Popen.
+
+    Mutates all_results in place with final statuses.
+    """
+    poll_interval = float(
+        global_params.get("_poll_interval", 2)
+    )
+
+    if dry_run:
+        for info in all_cases_info:
+            worker_cmd = [
+                sys.executable, "-m",
+                "q8020_cfd_metautil.sweep_worker",
+                str(info["args_file"]),
+            ]
+            print(
+                f"  {DIM}Would launch:{RESET}"
+                f" {' '.join(worker_cmd)}"
+            )
+        return
+
+    inflight: list[dict[str, Any]] = []
+
+    for info in all_cases_info:
+        worker_cmd = [
+            sys.executable, "-m",
+            "q8020_cfd_metautil.sweep_worker",
+            str(info["args_file"]),
+        ]
+
+        print(f"  {YELLOW}Launched:{RESET} {info['case_id']}"
+              f" ({info['experiment_id']})")
+
+        stdout_log = (
+            info["case_dir"] / "pipeline_stdout.txt"
+        )
+        stderr_log = (
+            info["case_dir"] / "pipeline_stderr.txt"
+        )
+        fout = open(stdout_log, "w", encoding="utf-8")
+        ferr = open(stderr_log, "w", encoding="utf-8")
+
+        proc = subprocess.Popen(
+            worker_cmd,
+            stdout=fout,
+            stderr=ferr,
+        )
+        inflight.append({
+            "proc": proc,
+            "info": info,
+            "start_time": time.time(),
+            "fout": fout,
+            "ferr": ferr,
+        })
+
+    # Poll loop
+    total = len(inflight)
+    completed = 0
+    failed = 0
+
+    print(
+        f"\n  {CYAN}Waiting for {total} cases...{RESET}\n",
+        flush=True,
+    )
+
+    remaining = list(inflight)
+    while remaining:
+        for entry in remaining[:]:
+            proc = entry["proc"]
+            ret = proc.poll()
+            if ret is None:
+                continue
+
+            remaining.remove(entry)
+            entry["fout"].close()
+            entry["ferr"].close()
+            info = entry["info"]
+            elapsed = time.time() - entry["start_time"]
+            eid = info["experiment_id"]
+            cid = info["case_id"]
+
+            result_file = (
+                info["case_dir"] / "pipeline_result.json"
+            )
+            if result_file.exists():
+                with open(result_file, encoding="utf-8") as f:
+                    case_result = json.load(f)
+            else:
+                case_result = {
+                    "case_id": cid,
+                    "experiment_id": eid,
+                    "status": "error",
+                    "returncode": ret,
+                    "output_dir": str(info["case_dir"]),
+                }
+
+            all_results[eid] = case_result
+
+            if ret == 0:
+                completed += 1
+                mins = int(elapsed // 60)
+                secs = elapsed % 60
+                print(
+                    f"  {GREEN}{BOLD}done:{RESET} {cid}"
+                    f" ({mins}m {secs:.0f}s)"
+                )
+            else:
+                failed += 1
+                print(
+                    f"  {RED}{BOLD}fail:{RESET} {cid}"
+                    f" (exit {ret})"
+                )
+
+            done = completed + failed
+            print(
+                f"       {done}/{total} "
+                f"({completed} ok, {failed} err)",
+                flush=True,
+            )
+
+        if remaining:
+            time.sleep(poll_interval)
+
+
+def _generate_sbatch_script(
+    cases_info: list[dict[str, Any]],
+    global_params: dict[str, Any],
+    run_dir: Path,
+) -> str:
+    """Generate a single sbatch script that runs all cases in parallel.
+
+    Returns the sbatch script content as a string.
+    """
+    project = global_params.get("_slurm_project", "<PROJECT_ID>")
+    walltime = global_params.get("_slurm_walltime", "02:00:00")
+    partition = global_params.get("_slurm_partition", "batch")
+    conda_archive = global_params.get("_slurm_conda_archive", "")
+    cores = int(global_params.get("_cores_per_task", 1))
+
+    n_cases = len(cases_info)
+    # Frontier: 64 cores per node
+    cores_per_node = 64
+    n_nodes = max(1, -(-n_cases // cores_per_node))  # ceiling div
+
+    # Collect worker commands
+    srun_lines = []
+    for info in cases_info:
+        worker = (
+            f"srun -n 1 -c {cores} --exclusive "
+            f"python -m q8020_cfd_metautil.sweep_worker "
+            f"{info['args_file']} &"
+        )
+        srun_lines.append(worker)
+
+    srun_block = "\n".join(srun_lines)
+
+    # Conda setup section (only if archive provided)
+    if conda_archive:
+        conda_section = f"""\
+# --- SBCAST conda environment to NVMe ---
+ENV_ARCHIVE={conda_archive}
+ENV_NAME=sweep_conda_env
+NVME_ENV_PATH=/mnt/bb/${{USER}}/${{ENV_NAME}}
+
+echo "Broadcasting conda env to ${{SLURM_NNODES}} nodes..."
+sbcast -pf $ENV_ARCHIVE /mnt/bb/${{USER}}/${{ENV_NAME}}.tar.gz
+if [ "$?" != "0" ]; then
+    echo "ERROR: sbcast failed"
+    exit 1
+fi
+
+srun -N ${{SLURM_NNODES}} --ntasks-per-node 1 \\
+    mkdir -p $NVME_ENV_PATH
+srun -N ${{SLURM_NNODES}} --ntasks-per-node 1 -c56 \\
+    tar --use-compress-program=pigz \\
+    -xf /mnt/bb/${{USER}}/${{ENV_NAME}}.tar.gz \\
+    -C $NVME_ENV_PATH
+
+source ${{NVME_ENV_PATH}}/bin/activate
+srun -N ${{SLURM_NNODES}} --ntasks-per-node 1 conda-unpack
+
+echo "Environment ready"
+echo ""
+"""
+    else:
+        conda_section = """\
+# No _slurm_conda_archive specified -- using default environment
+"""
+
+    script = f"""\
+#!/bin/bash
+#SBATCH -J q8020_sweep
+#SBATCH -A {project}
+#SBATCH -t {walltime}
+#SBATCH -N {n_nodes}
+#SBATCH -C nvme
+#SBATCH -p {partition}
+#SBATCH -o {run_dir}/slurm_%j.out
+#SBATCH -e {run_dir}/slurm_%j.err
+
+echo "Job ID: $SLURM_JOB_ID"
+echo "Nodes:  $SLURM_JOB_NUM_NODES"
+echo "Cases:  {n_cases}"
+echo "Start:  $(date)"
+echo ""
+
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+
+cd $SLURM_SUBMIT_DIR || exit 1
+
+{conda_section}
+# --- Launch all cases in parallel ---
+echo "Launching {n_cases} cases..."
+START_TIME=$(date +%s)
+
+{srun_block}
+
+# Wait for all background srun tasks
+wait
+
+END_TIME=$(date +%s)
+ELAPSED=$((END_TIME - START_TIME))
+echo ""
+echo "All cases finished."
+echo "Wall time: $((ELAPSED / 60))m $((ELAPSED % 60))s"
+"""
+    return script
+
+
+def _collect_parallel_cases(
+    expanded_cases: dict[str, dict[str, Any]],
+    run_dir: Path,
+    workflow_id: str,
+    group_executable: str,
+    script_dir: Path,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Prepare cases for parallel launch (local or SLURM).
+
+    Returns (results_dict, cases_info_list). The caller
+    accumulates cases_info across groups then launches
+    everything at once.
+    """
+    results: dict[str, Any] = {}
+    cases_info: list[dict[str, Any]] = []
+
+    for case_id, params in expanded_cases.items():
+        info = _build_case_launch_info(
+            case_id, params, run_dir, workflow_id,
+            group_executable, script_dir,
+        )
+        cases_info.append(info)
+        results[info["experiment_id"]] = {
+            "case_id": case_id,
+            "experiment_id": info["experiment_id"],
+            "output_dir": str(info["case_dir"]),
+            "status": "pending",
+        }
+        print(f"  {DIM}Prepared:{RESET} {case_id}"
+              f" ({info['experiment_id']})")
+
+    return results, cases_info
+
+
+def _finalize_slurm(
+    all_cases_info: list[dict[str, Any]],
+    all_results: dict[str, Any],
+    global_params: dict[str, Any],
+    run_dir: Path,
+    dry_run: bool = False,
+) -> None:
+    """Generate one sbatch script for all collected cases.
+
+    Mutates all_results in place to update status.
+    """
+    sbatch_content = _generate_sbatch_script(
+        all_cases_info, global_params, run_dir,
+    )
+    sbatch_file = run_dir / "q8020_sweep.sbatch"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    with open(sbatch_file, "w", encoding="utf-8") as f:
+        f.write(sbatch_content)
+
+    print(f"{CYAN}Generated:{RESET} {sbatch_file}")
+    print(
+        f"{DIM}{len(all_cases_info)} cases"
+        f" in one job{RESET}"
+    )
+
+    if dry_run:
+        return
+
+    slurm_submit = global_params.get("_slurm_submit", False)
+    if slurm_submit:
+        try:
+            sub = subprocess.run(
+                ["sbatch", str(sbatch_file)],
+                capture_output=True, text=True,
+                check=True,
+            )
+            job_line = sub.stdout.strip()
+            print(
+                f"{GREEN}{BOLD}Submitted:{RESET} {job_line}"
+            )
+            for eid in all_results:
+                all_results[eid]["status"] = "submitted"
+                all_results[eid]["slurm_output"] = job_line
+        except Exception as e:
+            print(
+                f"{RED}{BOLD}sbatch failed:{RESET} {e}",
+                file=sys.stderr,
+            )
+            for eid in all_results:
+                all_results[eid]["status"] = "submit_error"
+                all_results[eid]["error"] = str(e)
+    else:
+        print(
+            f"\nTo submit: {BOLD}sbatch {sbatch_file}{RESET}"
+        )
+        for eid in all_results:
+            all_results[eid]["status"] = "generated"
+
+
+# ---------------------------------------------------------------------------
 # Sweep configuration and execution
 # ---------------------------------------------------------------------------
 
@@ -877,22 +1549,39 @@ def run_postproc(
     return results
 
 
-def run_sweep(toml_path: str, script: str, arg_mapping: dict = None, dry_run: bool = False, group_filter: list = None) -> dict:
-    """
-    Run a parameter sweep from a TOML configuration file.
-    
+def run_sweep(
+    toml_path: str,
+    script: str,
+    arg_mapping: dict = None,
+    dry_run: bool = False,
+    group_filter: list = None,
+    overrides: dict[str, str] | None = None,
+) -> dict:
+    """Run a parameter sweep from a TOML configuration file.
+
     Args:
-        toml_path: Path to the TOML configuration file
-        script: Path to the Python script to run (will be invoked as 'python <script>')
-        arg_mapping: Optional mapping of param names to CLI arg names
-        dry_run: If True, print commands without executing
-        group_filter: Optional list of group names to run (if None, run all groups)
-    
-    Returns:
-        dict with results for each case
+        overrides: CLI --set overrides applied to [global].
     """
     config = load_sweep_config(toml_path)
     global_params = config["global"]
+
+    # Apply CLI overrides to global params
+    if overrides:
+        for key, value in overrides.items():
+            # Coerce "true"/"false" to bool
+            if value.lower() == "true":
+                global_params[key] = True
+            elif value.lower() == "false":
+                global_params[key] = False
+            else:
+                # Try int, then float, then keep as string
+                try:
+                    global_params[key] = int(value)
+                except ValueError:
+                    try:
+                        global_params[key] = float(value)
+                    except ValueError:
+                        global_params[key] = value
     groups = config["groups"]
     
     # Filter groups if group_filter is specified
@@ -978,39 +1667,121 @@ def run_sweep(toml_path: str, script: str, arg_mapping: dict = None, dry_run: bo
     
     all_case_dirs: list[Path] = []
 
-    print(f"{CYAN}{BOLD}Running sweep:{RESET} {total_cases} cases in {len(groups)} groups")
+    run_mode = global_params.get("_run_mode", "sequential")
+    use_slurm = bool(global_params.get("_slurm", False))
+
+    mode_label = run_mode
+    if run_mode == "parallel" and use_slurm:
+        mode_label = "parallel (slurm)"
+
+    print(
+        f"{CYAN}{BOLD}Running sweep:{RESET}"
+        f" {total_cases} cases in {len(groups)} groups"
+        f" [{mode_label}]"
+    )
     print(f"{CYAN}{BOLD}Output directory:{RESET} {run_dir}")
     print()
+
+    # For parallel modes, accumulate cases across groups
+    parallel_all_cases_info: list[dict[str, Any]] = []
+    parallel_all_results: dict[str, Any] = {}
 
     # Process each group
     for group_id, group_data in groups.items():
         group_params = group_data["params"]
         expanded_cases = group_data["expanded_cases"]
-        
+
         # Check for per-group _script override
         group_script = group_params.get("_script")
         if group_script:
             group_executable = group_script
         else:
             group_executable = executable
-        
-        # If _env is set, prepend venv activation to the script command
+
+        # If _env is set, prepend venv activation
         env_path = group_params.get("_env")
         if env_path and group_executable:
-            env_path_resolved = Path(env_path).expanduser().resolve()
-            activate_cmd = f"source {env_path_resolved}/bin/activate"
-            # Only prepend if not already activating this venv
+            env_path_resolved = (
+                Path(env_path).expanduser().resolve()
+            )
+            activate_cmd = (
+                f"source {env_path_resolved}/bin/activate"
+            )
             if activate_cmd not in group_executable:
-                group_executable = f"{activate_cmd} && {group_executable}"
-        
-        print(f"{CYAN}{BOLD}=== Group: {group_id} ({len(expanded_cases)} cases) ==={RESET}")
-        
+                group_executable = (
+                    f"{activate_cmd} && {group_executable}"
+                )
+
+        n_cases = len(expanded_cases)
+        print(
+            f"{CYAN}{BOLD}=== Group: {group_id}"
+            f" ({n_cases} cases) ==={RESET}"
+        )
+
+        # ----- parallel path (collect all, launch after loop) ---
+        if run_mode == "parallel":
+            group_results, group_cases_info = (
+                _collect_parallel_cases(
+                    expanded_cases, run_dir, workflow_id,
+                    group_executable, script_dir,
+                )
+            )
+            parallel_all_cases_info.extend(group_cases_info)
+            parallel_all_results.update(group_results)
+            results["cases"].update(group_results)
+
+            # Collect case_dirs for group/final postproc
+            for eid, cr in group_results.items():
+                odir = cr.get("output_dir")
+                if odir:
+                    all_case_dirs.append(Path(odir))
+
+            # Group postproc: print command only, don't run
+            group_postproc = group_params.get(
+                "_group_postproc", []
+            )
+            if group_postproc:
+                if isinstance(group_postproc, str):
+                    group_postproc = [group_postproc]
+                case_dirs_list = [
+                    cr.get("output_dir", "")
+                    for cr in group_results.values()
+                ]
+                postproc_data = {
+                    "group_id": group_id,
+                    "workflow_id": workflow_id,
+                    "run_dir": str(run_dir),
+                    "case_dirs": case_dirs_list,
+                    "params": group_params,
+                }
+                postproc_json = (
+                    run_dir
+                    / f"_group_postproc_{group_id}.json"
+                )
+                if not dry_run:
+                    with open(
+                        postproc_json, "w", encoding="utf-8"
+                    ) as f:
+                        json.dump(postproc_data, f, indent=2)
+                print(
+                    f"\n  {YELLOW}Group postproc"
+                    f" (run manually):{RESET}"
+                )
+                for pp_cmd in group_postproc:
+                    print(
+                        f"    {pp_cmd} {postproc_json}"
+                    )
+
+            print()
+            continue
+
+        # ----- sequential path (unchanged) -----
         group_case_dirs = []
-        
+
         # Run each expanded case in the group
         for case_id, params in expanded_cases.items():
             print(f"  {YELLOW}Case:{RESET} {case_id}")
-            
+
             # Generate experiment_id for this case
             experiment_id = generate_experiment_id()
 
@@ -1024,46 +1795,75 @@ def run_sweep(toml_path: str, script: str, arg_mapping: dict = None, dry_run: bo
             # Build command args
             cmd_args = build_command_args(params, arg_mapping)
 
-            # Inject outdir arg if _inject_outdir is set (value is the full arg name, e.g., "-outdir")
+            # Inject outdir arg if _inject_outdir is set
             inject_outdir = params.get("_inject_outdir")
             if inject_outdir:
                 cmd_args.extend([inject_outdir, str(case_dir)])
 
-            # Check if _script contains shell operators (needs bash -c)
-            if "&&" in group_executable or "||" in group_executable or "|" in group_executable:
-                # Shell command - wrap with bash -c
-                full_cmd = f"{group_executable} {' '.join(cmd_args)}"
+            # Check if _script contains shell operators
+            if ("&&" in group_executable
+                    or "||" in group_executable
+                    or "|" in group_executable):
+                full_cmd = (
+                    f"{group_executable}"
+                    f" {' '.join(cmd_args)}"
+                )
                 cmd = ["bash", "-c", full_cmd]
             else:
-                # Simple command - split and expand paths
                 cmd_parts = group_executable.split()
-                cmd_parts = [str(Path(p).expanduser()) if p.startswith("~") or "/" in p or "\\" in p 
-                             else p for p in cmd_parts]
+                cmd_parts = [
+                    str(Path(p).expanduser())
+                    if p.startswith("~")
+                    or "/" in p or "\\" in p
+                    else p
+                    for p in cmd_parts
+                ]
                 cmd = cmd_parts + cmd_args
 
             if dry_run:
-                # For shell commands, show the bash -c with quoted argument
                 if cmd[0] == "bash" and cmd[1] == "-c":
-                    print(f"    Command: bash -c \"{cmd[2]}\"")
+                    print(
+                        f"    Command: bash -c \"{cmd[2]}\""
+                    )
                 else:
-                    print(f"    Command: {' '.join(cmd)}")
-                results["cases"][experiment_id] = {"command": cmd, "status": "dry_run"}
+                    print(
+                        f"    Command: {' '.join(cmd)}"
+                    )
+                results["cases"][experiment_id] = {
+                    "command": cmd, "status": "dry_run",
+                }
 
-                # Run per-case preproc in dry-run mode
-                case_preproc = params.get("_case_preproc", [])
+                case_preproc = params.get(
+                    "_case_preproc", []
+                )
                 if case_preproc:
                     if isinstance(case_preproc, str):
                         case_preproc = [case_preproc]
-                    case_preproc_json = case_dir / f"q8020_case_preproc_{experiment_id}.json"
-                    run_postproc(case_preproc, case_preproc_json, script_dir, dry_run)
+                    pp_json = (
+                        case_dir
+                        / f"q8020_case_preproc_"
+                        f"{experiment_id}.json"
+                    )
+                    run_postproc(
+                        case_preproc, pp_json,
+                        script_dir, dry_run,
+                    )
 
-                # Run per-case postproc in dry-run mode
-                case_postproc = params.get("_case_postproc", [])
+                case_postproc = params.get(
+                    "_case_postproc", []
+                )
                 if case_postproc:
                     if isinstance(case_postproc, str):
                         case_postproc = [case_postproc]
-                    case_postproc_json = case_dir / f"q8020_case_postproc_{experiment_id}.json"
-                    run_postproc(case_postproc, case_postproc_json, script_dir, dry_run)
+                    pp_json = (
+                        case_dir
+                        / f"q8020_case_postproc_"
+                        f"{experiment_id}.json"
+                    )
+                    run_postproc(
+                        case_postproc, pp_json,
+                        script_dir, dry_run,
+                    )
                 continue
 
             # Run per-case preproc if specified
@@ -1082,12 +1882,17 @@ def run_sweep(toml_path: str, script: str, arg_mapping: dict = None, dry_run: bo
                 }
                 case_preproc_json = (
                     case_dir
-                    / f"q8020_case_preproc_{experiment_id}.json"
+                    / f"q8020_case_preproc_"
+                    f"{experiment_id}.json"
                 )
                 if not dry_run:
-                    with open(case_preproc_json, "w",
-                              encoding="utf-8") as f:
-                        json.dump(case_preproc_data, f, indent=2)
+                    with open(
+                        case_preproc_json, "w",
+                        encoding="utf-8",
+                    ) as f:
+                        json.dump(
+                            case_preproc_data, f, indent=2
+                        )
 
                 t_pp_start = time.perf_counter()
                 case_pre_results = run_postproc(
@@ -1096,14 +1901,16 @@ def run_sweep(toml_path: str, script: str, arg_mapping: dict = None, dry_run: bo
                     case_dir=case_dir, proc_type="preproc",
                     experiment_id=experiment_id,
                 )
-                t_preproc = time.perf_counter() - t_pp_start
+                t_preproc = (
+                    time.perf_counter() - t_pp_start
+                )
                 if experiment_id not in results["cases"]:
                     results["cases"][experiment_id] = {}
                 results["cases"][experiment_id][
                     "_case_preproc"
                 ] = case_pre_results
 
-            # Get _env path if specified for env snapshotting
+            # Get _env path for env snapshotting
             env_path = params.get("_env")
 
             # Run the case via run_single()
@@ -1121,14 +1928,27 @@ def run_sweep(toml_path: str, script: str, arg_mapping: dict = None, dry_run: bo
             results["cases"][experiment_id] = case_result
 
             if case_result["status"] == "success":
-                print(f"    {GREEN}{BOLD}✓ Case completed{RESET}")
+                print(
+                    f"    {GREEN}{BOLD}"
+                    f"done{RESET}"
+                )
             elif case_result["status"] == "error":
-                print(f"    {RED}{BOLD}✗ Error (code {case_result.get('returncode')}){RESET}")
+                print(
+                    f"    {RED}{BOLD}"
+                    f"error (code "
+                    f"{case_result.get('returncode')})"
+                    f"{RESET}"
+                )
             else:
-                print(f"    {RED}{BOLD}✗ {case_result['status']}{RESET}")
+                print(
+                    f"    {RED}{BOLD}"
+                    f"{case_result['status']}{RESET}"
+                )
 
             # Run per-case postproc if specified
-            case_postproc = params.get("_case_postproc", [])
+            case_postproc = params.get(
+                "_case_postproc", []
+            )
             t_postproc = 0.0
             if case_postproc:
                 if isinstance(case_postproc, str):
@@ -1143,12 +1963,17 @@ def run_sweep(toml_path: str, script: str, arg_mapping: dict = None, dry_run: bo
                 }
                 case_postproc_json = (
                     case_dir
-                    / f"q8020_case_postproc_{experiment_id}.json"
+                    / f"q8020_case_postproc_"
+                    f"{experiment_id}.json"
                 )
                 if not dry_run:
-                    with open(case_postproc_json, "w",
-                              encoding="utf-8") as f:
-                        json.dump(case_postproc_data, f, indent=2)
+                    with open(
+                        case_postproc_json, "w",
+                        encoding="utf-8",
+                    ) as f:
+                        json.dump(
+                            case_postproc_data, f, indent=2
+                        )
 
                 t_pp_start = time.perf_counter()
                 case_pp_results = run_postproc(
@@ -1157,7 +1982,9 @@ def run_sweep(toml_path: str, script: str, arg_mapping: dict = None, dry_run: bo
                     case_dir=case_dir, proc_type="postproc",
                     experiment_id=experiment_id,
                 )
-                t_postproc = time.perf_counter() - t_pp_start
+                t_postproc = (
+                    time.perf_counter() - t_pp_start
+                )
                 results["cases"][experiment_id][
                     "_case_postproc"
                 ] = case_pp_results
@@ -1167,77 +1994,137 @@ def run_sweep(toml_path: str, script: str, arg_mapping: dict = None, dry_run: bo
             if not dry_run:
                 metadata_file = (
                     case_dir
-                    / f"q8020_metadata_{experiment_id}.json"
+                    / f"q8020_metadata_"
+                    f"{experiment_id}.json"
                 )
                 unified_metadata, warnings, _ = (
                     harvest_metadata(case_dir)
                 )
                 for warning in warnings:
                     print(
-                        f"    ⚠️  {warning}", file=sys.stderr
+                        f"    warning: {warning}",
+                        file=sys.stderr,
                     )
-                with open(metadata_file, "w",
-                          encoding="utf-8") as f:
-                    json.dump(unified_metadata, f, indent=2)
-            t_harvest = time.perf_counter() - t_harvest_start
+                with open(
+                    metadata_file, "w", encoding="utf-8"
+                ) as f:
+                    json.dump(
+                        unified_metadata, f, indent=2
+                    )
+            t_harvest = (
+                time.perf_counter() - t_harvest_start
+            )
 
             # Merge overhead timing into case result
             overhead = case_result.get("overhead", {})
-            overhead["preproc_seconds"] = round(t_preproc, 6)
+            overhead["preproc_seconds"] = round(
+                t_preproc, 6
+            )
             overhead["postproc_seconds"] = round(
                 t_postproc, 6
             )
-            overhead["harvest_seconds"] = round(t_harvest, 6)
+            overhead["harvest_seconds"] = round(
+                t_harvest, 6
+            )
             case_result["overhead"] = overhead
             results["cases"][experiment_id] = case_result
-        
-        # Run group postproc for this group if specified
-        group_postproc = group_params.get("_group_postproc", [])
+
+        # Run group postproc (sequential mode)
+        group_postproc = group_params.get(
+            "_group_postproc", []
+        )
         if group_postproc:
-            # Ensure postproc is a list
             if isinstance(group_postproc, str):
                 group_postproc = [group_postproc]
-            
-            # Prepare postproc data
+
             postproc_data = {
                 "group_id": group_id,
                 "workflow_id": workflow_id,
                 "run_dir": str(run_dir),
-                "case_dirs": [str(d) for d in group_case_dirs],
-                "params": group_params
+                "case_dirs": [
+                    str(d) for d in group_case_dirs
+                ],
+                "params": group_params,
             }
-            postproc_json = run_dir / f"_group_postproc_{group_id}.json"
+            postproc_json = (
+                run_dir / f"_group_postproc_{group_id}.json"
+            )
             if not dry_run:
-                with open(postproc_json, "w", encoding="utf-8") as f:
+                with open(
+                    postproc_json, "w", encoding="utf-8"
+                ) as f:
                     json.dump(postproc_data, f, indent=2)
-            
-            postproc_results = run_postproc(group_postproc, postproc_json, script_dir, dry_run)
-            results["groups"][group_id] = {"_group_postproc": postproc_results}
-        
+
+            postproc_results = run_postproc(
+                group_postproc, postproc_json,
+                script_dir, dry_run,
+            )
+            results["groups"][group_id] = {
+                "_group_postproc": postproc_results,
+            }
+
         print()
-    
-    # Run _final_postproc if specified (runs after all groups complete)
-    final_postproc = global_params.get("_final_postproc", [])
+
+    # Launch all parallel cases after groups are collected
+    if run_mode == "parallel" and parallel_all_cases_info:
+        if use_slurm:
+            _finalize_slurm(
+                parallel_all_cases_info,
+                parallel_all_results,
+                global_params, run_dir, dry_run,
+            )
+        else:
+            _finalize_local_parallel(
+                parallel_all_cases_info,
+                parallel_all_results,
+                global_params, dry_run,
+            )
+        # Update statuses in main results
+        for eid, pr in parallel_all_results.items():
+            if eid in results["cases"]:
+                results["cases"][eid].update(pr)
+        print()
+
+    # Final postproc
+    final_postproc = global_params.get(
+        "_final_postproc", []
+    )
     if final_postproc:
         if isinstance(final_postproc, str):
             final_postproc = [final_postproc]
-        
-        # Write final_postproc JSON file
+
         final_postproc_data = {
             "workflow_id": workflow_id,
             "run_dir": str(run_dir),
             "case_dirs": [str(d) for d in all_case_dirs],
             "groups": list(groups.keys()),
-            "global_params": global_params
+            "global_params": global_params,
         }
         final_postproc_json = run_dir / "_final_postproc.json"
         if not dry_run:
-            with open(final_postproc_json, "w", encoding="utf-8") as f:
+            with open(
+                final_postproc_json, "w", encoding="utf-8"
+            ) as f:
                 json.dump(final_postproc_data, f, indent=2)
-        
-        print(f"{CYAN}{BOLD}=== Running final postproc ==={RESET}")
-        final_postproc_results = run_postproc(final_postproc, final_postproc_json, script_dir, dry_run)
-        results["_final_postproc"] = final_postproc_results
+
+        if run_mode == "parallel":
+            # Print command only, don't run
+            print(
+                f"{YELLOW}Final postproc"
+                f" (run manually):{RESET}"
+            )
+            for fp_cmd in final_postproc:
+                print(f"  {fp_cmd} {final_postproc_json}")
+        else:
+            print(
+                f"{CYAN}{BOLD}"
+                f"=== Running final postproc ==={RESET}"
+            )
+            fp_results = run_postproc(
+                final_postproc, final_postproc_json,
+                script_dir, dry_run,
+            )
+            results["_final_postproc"] = fp_results
         print()
     
     # Record sweep end time and save overall results
@@ -1287,21 +2174,48 @@ Usage:
         "--dry-run", action="store_true",
         help="Print commands without executing"
     )
+    parser.add_argument(
+        "--set", action="append", default=[],
+        metavar="KEY=VALUE", dest="overrides",
+        help="Override a [global] _key "
+        "(e.g. --set _output_dir=/scratch/out)"
+    )
 
     args = parser.parse_args()
+
+    # Parse --set overrides into a dict
+    overrides: dict[str, str] = {}
+    for item in args.overrides:
+        if "=" not in item:
+            print(
+                f"Error: --set requires KEY=VALUE, "
+                f"got: {item}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        key, value = item.split("=", 1)
+        overrides[key] = value
 
     # Convert empty list to None for group_filter
     group_filter = args.groups if args.groups else None
 
     try:
-        # Read _script from TOML
+        # Read _script from TOML (may be overridden)
         with open(args.toml_file, "rb") as f:
             toml_data = tomllib.load(f)
-            script = toml_data.get("global", toml_data.get("_global", {})).get("_script")
-            # Allow None - groups may specify their own _script
+            global_sect = toml_data.get(
+                "global", toml_data.get("_global", {})
+            )
+            script = overrides.get(
+                "_script",
+                global_sect.get("_script"),
+            )
 
         results = run_sweep(
-            args.toml_file, script, dry_run=args.dry_run, group_filter=group_filter
+            args.toml_file, script,
+            dry_run=args.dry_run,
+            group_filter=group_filter,
+            overrides=overrides,
         )
 
         # Print summary
