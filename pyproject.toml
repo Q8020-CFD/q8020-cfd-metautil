@@ -20,6 +20,7 @@ dependencies = [
 [project.scripts]
 q8020-sweep = "q8020_cfd_metautil.sweep:main"
 q8020-harvest = "q8020_cfd_metautil.harvest:main"
+q8020-compare = "q8020_cfd_metautil.compare:main"
 
 
 [tool.setuptools.packages.find]
