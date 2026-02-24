@@ -114,14 +114,18 @@ def flatten(
     obj: Any,
     prefix: str = "",
     depth: int = 0,
+    max_depth: int | None = None,
 ) -> dict[str, Any]:
     """Recursively flatten *obj* into dot-separated scalar keys.
 
     Lists are indexed (e.g. ``backend.0.name``).  Containers deeper than
-    ``_MAX_DEPTH`` are summarised rather than expanded.
+    *max_depth* (default ``_MAX_DEPTH``) are summarised rather than expanded.
+    Pass ``max_depth=0`` for unlimited depth.
     """
+    if max_depth is None:
+        max_depth = _MAX_DEPTH
     out: dict[str, Any] = {}
-    if depth >= _MAX_DEPTH:
+    if max_depth > 0 and depth >= max_depth:
         out[prefix] = _summarise(obj)
         return out
 
@@ -129,14 +133,14 @@ def flatten(
         for k, v in obj.items():
             key = f"{prefix}.{k}" if prefix else k
             if isinstance(v, (dict, list)) and v:
-                out.update(flatten(v, key, depth + 1))
+                out.update(flatten(v, key, depth + 1, max_depth))
             else:
                 out[key] = v
     elif isinstance(obj, list):
         for i, v in enumerate(obj):
             key = f"{prefix}.{i}" if prefix else str(i)
             if isinstance(v, (dict, list)) and v:
-                out.update(flatten(v, key, depth + 1))
+                out.update(flatten(v, key, depth + 1, max_depth))
             else:
                 out[key] = v
     else:

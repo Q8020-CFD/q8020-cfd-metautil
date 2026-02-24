@@ -95,7 +95,7 @@ def collect_key_counts(
             print(f"Warning: skipping {cd}: {exc}", file=sys.stderr)
             continue
         loaded += 1
-        flat = flatten(meta)
+        flat = flatten(meta, max_depth=0)
         for key in flat:
             if skip_patterns and _should_skip(key, skip_patterns):
                 continue
@@ -156,50 +156,51 @@ def render_json(
     print(json.dumps(out, indent=2))
 
 
-def _short_name(key: str) -> str:
-    """Return the last token of a dotted key name."""
-    return key.rsplit(".", 1)[-1]
+def _canonical_key(key: str) -> str:
+    """Strip all-numeric path segments from a dotted key."""
+    return ".".join(
+        tok for tok in key.split(".") if not tok.isdigit()
+    )
 
 
-def render_short_names(
+def render_names(
     key_counts: dict[str, int],
-    combine: bool = False,
 ) -> None:
-    """Print just the key names, one per line.
-
-    With *combine* the last dot-separated token is printed (deduplicated).
-    Without *combine* the full dotted key name is printed.
-    """
-    if combine:
-        seen: set[str] = set()
-        for key in sorted(key_counts):
-            short = _short_name(key)
-            if short not in seen:
-                seen.add(short)
-                print(short)
-    else:
-        for key in sorted(key_counts):
-            print(key)
+    """Print full dotted key names, one per line, sorted."""
+    for key in sorted(key_counts):
+        print(key)
 
 
-def render_combine_json(
+def render_combined(
+    key_counts: dict[str, int],
+) -> None:
+    """Print canonical keys (numeric segments stripped), deduplicated, sorted."""
+    seen: set[str] = set()
+    for key in sorted(key_counts):
+        canon = _canonical_key(key)
+        if canon not in seen:
+            seen.add(canon)
+            print(canon)
+
+
+def render_combined_json(
     key_counts: dict[str, int],
     total_cases: int,
     no_metadata: int,
 ) -> None:
-    """Print JSON keyed by last token, with full key names listed."""
+    """Print JSON keyed by canonical name, with full key names listed."""
     groups: dict[str, list[str]] = {}
     for key in sorted(key_counts):
-        short = _short_name(key)
-        groups.setdefault(short, []).append(key)
+        canon = _canonical_key(key)
+        groups.setdefault(canon, []).append(key)
 
     keys_obj: dict[str, dict[str, Any]] = {}
-    for short in sorted(groups):
-        full_keys = groups[short]
+    for canon in sorted(groups):
+        full_keys = groups[canon]
         counts = [key_counts[k] for k in full_keys]
         pcts = [round(c / total_cases * 100, 1) if total_cases else 0
                 for c in counts]
-        keys_obj[short] = {
+        keys_obj[canon] = {
             "full_keys": full_keys,
             "count": counts[0] if len(counts) == 1 else counts,
             "pct": pcts[0] if len(pcts) == 1 else pcts,
@@ -223,6 +224,20 @@ def main() -> None:
             "All keys are shown (no skip patterns) unless --skip is used."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "output modes:\n"
+            "  full       Every key with count and pct (default). JSON unless --table.\n"
+            "  names      Full dotted key names, one per line, sorted.\n"
+            "  combined   Canonical keys (numeric indices stripped), deduplicated.\n"
+            "             Plain text unless --json.\n"
+            "\n"
+            "examples:\n"
+            "  q8020-metakeys sweep/                          # full JSON\n"
+            "  q8020-metakeys sweep/ --table                  # full plain-text table\n"
+            "  q8020-metakeys sweep/ --mode names             # one key per line\n"
+            "  q8020-metakeys sweep/ --mode combined          # canonical keys\n"
+            "  q8020-metakeys sweep/ --mode combined --json   # grouped JSON\n"
+        ),
     )
     parser.add_argument(
         "dirs",
@@ -230,6 +245,27 @@ def main() -> None:
         type=Path,
         metavar="DIR",
         help="One or more case or sweep directories to scan (recursive)",
+    )
+    parser.add_argument(
+        "--mode", "-m",
+        choices=["full", "names", "combined"],
+        default="full",
+        help=(
+            "Output mode: 'full' (default) shows every key with count/pct; "
+            "'names' prints full dotted key names one per line; "
+            "'combined' strips numeric indices and deduplicates"
+        ),
+    )
+    parser.add_argument(
+        "--table",
+        action="store_true",
+        help="Plain-text table instead of JSON (only with --mode full)",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_output",
+        help="JSON output (with --mode full or --mode combined)",
     )
     parser.add_argument(
         "--skip",
@@ -256,29 +292,15 @@ def main() -> None:
             "Percentages are relative to cases with metadata."
         ),
     )
-    parser.add_argument(
-        "--short",
-        action="store_true",
-        help=(
-            "Print just the key names, one per line (no counts or JSON). "
-            "Combine with --combine to print only the last token of each key."
-        ),
-    )
-    parser.add_argument(
-        "--combine",
-        action="store_true",
-        help=(
-            "Group keys by their last dot-separated token. "
-            "JSON output lists full key names under each short name. "
-            "With --short, prints deduplicated short names only."
-        ),
-    )
-    parser.add_argument(
-        "--table",
-        action="store_true",
-        help="Output as plain-text table instead of JSON (default is JSON)",
-    )
     args = parser.parse_args()
+
+    # Validate flag combinations.
+    if args.table and args.mode != "full":
+        print("Error: --table is only valid with --mode full", file=sys.stderr)
+        sys.exit(1)
+    if args.json_output and args.mode == "names":
+        print("Error: --json is not valid with --mode names", file=sys.stderr)
+        sys.exit(1)
 
     # Recursively discover case dirs.
     case_dirs: list[Path] = []
@@ -309,12 +331,15 @@ def main() -> None:
         total_cases = n_loaded
         no_metadata = 0
 
-    if args.short:
-        render_short_names(key_counts, combine=args.combine)
+    if args.mode == "names":
+        render_names(key_counts)
+    elif args.mode == "combined":
+        if args.json_output:
+            render_combined_json(key_counts, total_cases, no_metadata)
+        else:
+            render_combined(key_counts)
     elif args.table:
         render_table(key_counts, total_cases, no_metadata)
-    elif args.combine:
-        render_combine_json(key_counts, total_cases, no_metadata)
     else:
         render_json(key_counts, total_cases, no_metadata)
 

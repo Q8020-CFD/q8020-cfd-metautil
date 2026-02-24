@@ -1,0 +1,119 @@
+spec: q8020-metakeys output modes
+==================================
+
+Problem
+-------
+Flattened metadata keys embed both structural path and iteration
+indices.  Given keys like:
+
+    case.0.dimension        case.1.dimension
+    backend.0.name          backend.1.name
+    results.0.fidelity
+    analysis.0.l2_error
+
+The existing --combine flag collapses to the last token only
+(dimension, name, fidelity, l2_error), losing the section prefix.
+Two unrelated keys that share a leaf name (case.0.name vs
+backend.0.name) become ambiguous.
+
+Three output modes
+------------------
+Replace --short / --combine / --table with a single --mode selector.
+
+  --mode full      Every key with count and pct (default)
+  --mode names     Full dotted key names, one per line
+  --mode combined  Path with numeric segments stripped, deduped
+
+full (default)
+--------------
+Current JSON output or --table for plain text.  No change to
+existing behavior.
+
+    q8020-metakeys sweep/
+    q8020-metakeys sweep/ --table
+
+names
+-----
+One full key per line, sorted, no counts.  Replaces --short without
+--combine.
+
+    q8020-metakeys sweep/ --mode names
+
+Output:
+
+    analysis.0.fidelity
+    analysis.0.l2_error
+    backend.0.name
+    backend.0.vendor
+    case.0.dimension
+    case.0.name
+    case.1.dimension
+    case.1.name
+    results.0.quantum_solution_normalized
+
+combined
+--------
+Strip all-numeric path segments, deduplicate, sort.  case.0.dimension
+and case.1.dimension both become case.dimension, but case.dimension
+and backend.dimension stay separate.
+
+    q8020-metakeys sweep/ --mode combined
+
+Output:
+
+    analysis.fidelity
+    analysis.l2_error
+    backend.name
+    backend.vendor
+    case.dimension
+    case.name
+    results.quantum_solution_normalized
+
+combined + --json
+-----------------
+Group full keys under their canonical name (replaces
+render_combine_json):
+
+    {
+      "total_cases": 12,
+      "no_metadata": 0,
+      "keys": {
+        "case.dimension": {
+          "full_keys": ["case.0.dimension", "case.1.dimension"],
+          "count": [12, 4],
+          "pct": [100.0, 33.3]
+        },
+        "backend.name": {
+          "full_keys": ["backend.0.name"],
+          "count": 12,
+          "pct": 100.0
+        }
+      }
+    }
+
+CLI changes
+-----------
+    --mode {full,names,combined}   Output mode (default: full)
+    --table                        Plain-text table (only with full)
+    --json                         JSON output (with full or combined)
+
+Drop --short and --combine.  Migration:
+
+    Old                     New
+    --short                 --mode names
+    --short --combine       --mode combined
+    --combine (no --short)  --mode combined --json
+
+Implementation
+--------------
+One new helper to strip numeric segments:
+
+    def _canonical_key(key: str) -> str:
+        """Strip all-numeric path segments from a dotted key."""
+        return ".".join(
+            tok for tok in key.split(".") if not tok.isdigit()
+        )
+
+Three render paths stay separate functions.  --mode dispatches to
+the right one.  Existing --section, --skip, --common filters apply
+to all modes.
