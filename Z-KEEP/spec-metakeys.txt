@@ -1,0 +1,112 @@
+spec: q8020-metakeys
+====================
+
+CLI tool that scans case directories, reads assembled metadata
+JSONs, and reports the union of all flattened keys with per-key
+coverage counts and percentages.
+
+Motivation
+----------
+Different solvers and experiment configurations produce different
+metadata fields.  q8020-compare --keys lists flattened key names
+but does not show how many cases actually contain each key.  When
+reviewing a large batch of results you need to know which keys are
+universal, which are sparse, and how many cases lack metadata
+entirely.
+
+This is an inventory tool -- the default is to show everything
+(no skip patterns).  compare.py's DEFAULT_SKIP_PATTERNS are
+designed for side-by-side diffing where verbose array keys are
+noise.  Here the goal is the opposite: see every key that exists
+anywhere in the corpus so you know the full schema shape.
+
+Scope
+-----
+Read-only.  Does not harvest, modify, or write any files.
+
+Discovery
+---------
+Accept one or more directory paths as positional args.  For each
+path, recursively find case directories using the same logic as
+compare.resolve_dirs: a dir is a case dir if it contains
+q8020_metadata_*.json; otherwise its immediate children are checked.
+
+Any case dir that does NOT contain a q8020_metadata_*.json is
+counted toward a special "(no metadata)" row in the output but
+otherwise skipped.  A case dir is any immediate subdirectory of a
+sweep run dir (i.e. directories that look like experiment output,
+not date dirs or other structural parents).  The heuristic for
+"is this a case dir without metadata" is: the directory contains
+at least one q8020_*_*.json fragment file but no assembled
+q8020_metadata_*.json.
+
+Flattening
+----------
+Reuse compare.flatten() (dot-separated keys, list indices, depth
+cap at 3).  No skip patterns applied by default -- all keys are
+shown including _source, paths, artifacts, etc.
+
+Output (default)
+----------------
+Sorted table, one row per key:
+
+    key                              count   pct
+    -----------------------------------------------
+    (no metadata)                        4   5.3%
+    analysis.0.hhl_metrics              71  94.7%
+    backend.0.basis_gates               71  94.7%
+    backend.0.name                      75 100.0%
+    backend.0.noise                     75 100.0%
+    case.0.name                         75 100.0%
+    ...
+    results.0.final_solution            71  94.7%
+    results.0.per_iteration             71  94.7%
+
+Footer line: "75 cases, 48 unique keys"
+
+The "(no metadata)" row always appears first if count > 0.
+
+count = number of cases whose flattened dict contains that key.
+pct   = count / total_cases * 100  (total_cases includes the
+        no-metadata cases).
+
+Options
+-------
+--skip PAT     Glob pattern(s) to suppress from output (repeatable).
+               e.g. --skip "artifacts*" --skip "*._source"
+--section SEC  Limit to keys under a specific top-level section
+               (e.g. --section results).
+--json         Output as JSON instead of table.  Schema:
+               {
+                 "total_cases": int,
+                 "no_metadata": int,
+                 "keys": {
+                   "<key>": {"count": int, "pct": float},
+                   ...
+                 }
+               }
+
+Entry point
+-----------
+q8020-metakeys (in pyproject.toml [project.scripts]).
+
+Module: q8020_cfd_metautil/metakeys.py
+
+Reusable from
+-------------
+compare.py:  resolve_dirs, load_metadata, flatten,
+             _should_skip (for optional --skip)
+meta_fragment.py:  FRAGMENT_PATTERN
+
+Implementation notes
+--------------------
+- Walk is shallow: resolve_dirs already handles the one-level
+  sweep dir expansion.  No need for deep recursion beyond that.
+- The "no metadata" detection: after resolve_dirs returns case
+  dirs with metadata, re-scan the original input dirs for child
+  dirs that have fragment files but were not returned by
+  resolve_dirs.
+- Percentages are always relative to total_cases (with-metadata
+  + no-metadata).
+- No dependency on pandas or rich; plain print formatting like
+  compare.render_table.

@@ -1,25 +1,32 @@
 """Harvest metadata fragments into a unified metadata.json.
 
 Collects fragment files (q8020_experiment_0.json, q8020_case_0.json, etc.)
-from an output directory and assembles them into a single metadata.json file.
+from a source directory and assembles them into a single metadata.json file.
 
 Can also invoke solver-specific harvesters to extract metadata from solver
 artifacts (CSVs, pickles, etc.) before rolling up into unified metadata.
 
+The --source directory can be a single case dir or a parent directory
+containing nested case dirs at any depth.  Case dirs are discovered
+recursively (a case dir contains q8020 fragment files).
+
 Usage:
-    # Roll up existing fragments only:
-    q8020-harvest --outdir /path/to/experiment
+    # Roll up a single case dir:
+    q8020-harvest --source /path/to/case_dir
     
-    # Run solver-specific harvester first, then roll up:
-    q8020-harvest --outdir /path/to/solver_output --harvester fvm_euler_1d
+    # Roll up all case dirs under a parent (recursive):
+    q8020-harvest --source /path/to/2025-11-11 --dest /tmp/harvest-out
     
-    q8020-harvest --outdir /path/to/experiment --output metadata.json
-    q8020-harvest --outdir /path/to/experiment --clean
+    # Run solver harvester first, then roll up:
+    q8020-harvest --source /path/to/2025-11-11 \
+        --harvester /path/to/fvm_euler_1d_solver_harvester.py \
+        --dest /tmp/harvest-out
 """
 
 import argparse
-import importlib
+import importlib.util
 import json
+import shutil
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -97,22 +104,26 @@ def _next_results_index(outdir: Path) -> int:
 
 def harvest_metadata(
     outdir: Path,
+    read_only: bool = False,
 ) -> tuple[dict[str, Any], list[str], dict[str, int]]:
     """
     Assemble metadata from fragment files.
 
     Also checks q8020_stdout.txt for JSON content and writes a results fragment
-    if found (without clobbering existing results fragments).
+    if found (without clobbering existing results fragments).  When *read_only*
+    is True the stdout fragment write is skipped so the source dir is not
+    modified.
 
     Args:
         outdir: Directory containing fragment files
+        read_only: If True, do not write any files back into *outdir*.
 
     Returns:
         Tuple of (unified metadata dict, list of warnings, fragment counts by section)
     """
     # Check stdout for JSON and write results fragment if found
     stdout_json = _extract_stdout_json(outdir)
-    if stdout_json:
+    if stdout_json and not read_only:
         next_idx = _next_results_index(outdir)
         write_results(outdir, {"_source": "stdout", **stdout_json}, index=next_idx)
 
@@ -148,10 +159,37 @@ def get_fragment_files(outdir: Path) -> list[Path]:
     return fragment_files
 
 
+def _copy_fragments(src: Path, dest: Path) -> None:
+    """Copy existing q8020 fragment files from *src* to *dest*."""
+    for p in src.iterdir():
+        if p.is_file() and FRAGMENT_PATTERN.match(p.name):
+            shutil.copy2(p, dest / p.name)
+
+
+def _load_harvester_module(harvester_path: Path):
+    """Load a harvester module from a file path."""
+    harvester_path = harvester_path.expanduser().resolve()
+    if not harvester_path.is_file():
+        raise FileNotFoundError(f"Harvester not found: {harvester_path}")
+    spec = importlib.util.spec_from_file_location(
+        harvester_path.stem, harvester_path,
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load harvester: {harvester_path}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    if not hasattr(mod, "generate_metadata"):
+        raise AttributeError(
+            f"Harvester '{harvester_path.name}' lacks generate_metadata function"
+        )
+    return mod
+
+
 def run_solver_harvester(
     outdir: Path,
-    harvester_name: str,
+    harvester_path: Path,
     experiment_id: str | None = None,
+    write_dir: Path | None = None,
 ) -> str:
     """
     Run a solver-specific harvester to extract metadata from solver artifacts.
@@ -159,160 +197,197 @@ def run_solver_harvester(
     This is used for standalone solver runs (outside of sweeper). It:
     1. Generates experiment_id if not provided
     2. Writes a generic experiment fragment with user/timestamp info
-    3. Dynamically loads and runs the solver-specific harvester
+    3. Loads the harvester from *harvester_path* and runs it
 
     Args:
         outdir: Directory containing solver output artifacts
-        harvester_name: Name of harvester (e.g., "fvm_euler_1d" loads
-                        q8020_cfd_metautil.harvesters.fvm_euler_1d_harvester)
+        harvester_path: Path to a Python file that exposes generate_metadata()
         experiment_id: Optional experiment ID; generated if not provided
+        write_dir: Directory to write fragments to.  Defaults to *outdir*.
 
     Returns:
         The experiment_id used
 
     Raises:
-        ImportError: If harvester module not found
+        FileNotFoundError: If harvester file not found
+        ImportError: If harvester cannot be loaded
         AttributeError: If harvester lacks generate_metadata function
     """
+    if write_dir is None:
+        write_dir = outdir
+
+    harvester_module = _load_harvester_module(harvester_path)
+
     # Generate IDs for standalone run
     if experiment_id is None:
         experiment_id = generate_experiment_id()
     workflow_id = generate_workflow_id(experiment_id)
     timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
-    # Write generic experiment fragment (sweeper would do this, but we're standalone)
+    # Write generic experiment fragment
     experiment_data = {
         "_source": "harvest",
-        "name": harvester_name,
+        "name": harvester_path.stem,
         "experiment_id": experiment_id,
         "workflow_id": workflow_id,
         "timestamp": timestamp,
         "user": make_user_meta(),
     }
-    write_experiment(outdir, experiment_data, experiment_id=experiment_id)
+    write_experiment(write_dir, experiment_data, experiment_id=experiment_id)
 
-    # Dynamically load solver-specific harvester
-    module_name = f"q8020_cfd_metautil.harvesters.{harvester_name}_harvester"
-    try:
-        harvester_module = importlib.import_module(module_name)
-    except ImportError as e:
-        raise ImportError(
-            f"Could not load harvester module '{module_name}': {e}"
-        ) from e
-
-    # Call the harvester's generate_metadata function
-    if not hasattr(harvester_module, "generate_metadata"):
-        raise AttributeError(
-            f"Harvester module '{module_name}' lacks generate_metadata function"
-        )
-
-    harvester_module.generate_metadata(outdir, experiment_id=experiment_id)
+    harvester_module.generate_metadata(
+        outdir, experiment_id=experiment_id, write_dir=write_dir,
+    )
 
     return experiment_id
 
 
+def _harvest_one(
+    source_dir: Path,
+    dest_dir: Path | None = None,
+    harvester_path: Path | None = None,
+) -> Path:
+    """Harvest a single case directory.
+
+    Returns the path to the written metadata JSON.
+    """
+    # Where to write fragments and rollup.
+    if dest_dir is not None:
+        write_dir = dest_dir
+        write_dir.mkdir(parents=True, exist_ok=True)
+        # Only copy existing fragments when there's no harvester —
+        # the harvester regenerates all fragments from scratch.
+        if harvester_path is None:
+            _copy_fragments(source_dir, write_dir)
+    else:
+        write_dir = source_dir
+
+    # Run solver-specific harvester if specified.
+    experiment_id = None
+    if harvester_path:
+        experiment_id = run_solver_harvester(
+            source_dir, harvester_path, write_dir=dest_dir,
+        )
+
+    # Determine output path.
+    if dest_dir is not None:
+        output_path = dest_dir / f"q8020_metadata_{source_dir.name}.json"
+    elif experiment_id:
+        output_path = source_dir / f"q8020_metadata_{experiment_id}.json"
+    else:
+        output_path = source_dir / "metadata.json"
+
+    # Roll up fragments.
+    metadata, warnings, fragment_counts = harvest_metadata(
+        write_dir, read_only=False,
+    )
+
+    for warning in warnings:
+        print(f"⚠️  {warning}", file=sys.stderr)
+
+    # Write output.
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
+
+    return output_path
+
+
 def main() -> None:
+    from q8020_cfd_metautil.metakeys import _walk_case_dirs
+
     parser = argparse.ArgumentParser(
-        description="Harvest metadata fragments into unified metadata.json",
+        description=(
+            "Harvest metadata fragments into unified metadata.json.\n"
+            "--source can be a single case dir or a parent directory;\n"
+            "case dirs are discovered recursively."
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Examples:
-  # Roll up existing fragments:
-  q8020-harvest --outdir /path/to/experiment
-  
-  # Run solver harvester first, then roll up:
-  q8020-harvest --outdir /path/to/solver_output --harvester fvm_euler_1d
-  
-  q8020-harvest --outdir /path/to/experiment --output metadata.json
-  q8020-harvest --outdir /path/to/experiment --clean
+  # Roll up a single case dir:
+  q8020-harvest --source /path/to/case_dir
+
+  # Recursively harvest all cases under a parent dir:
+  q8020-harvest --source /path/to/2025-11-11 --dest /tmp/harvest-out
+
+  # Run solver harvester on all cases, write to dest:
+  q8020-harvest --source /path/to/2025-11-11 \\
+      --harvester /path/to/fvm_euler_1d_solver_harvester.py \\
+      --dest /tmp/out
 """,
     )
     parser.add_argument(
-        "--outdir", "-d",
+        "--source", "-s",
         type=str,
         required=True,
-        help="Directory containing solver output or fragment files",
+        help=(
+            "Source directory to harvest.  Can be a single case dir or a "
+            "parent directory containing nested case dirs (recursive)."
+        ),
     )
     parser.add_argument(
         "--harvester", "-H",
+        type=Path,
+        default=None,
+        metavar="FILE",
+        help=(
+            "Path to a solver-specific harvester Python file that exposes "
+            "generate_metadata(outdir, experiment_id, write_dir)."
+        ),
+    )
+    parser.add_argument(
+        "--dest", "-d",
         type=str,
         default=None,
-        help="Solver-specific harvester name (e.g., 'fvm_euler_1d')",
-    )
-    parser.add_argument(
-        "--output", "-o",
-        type=str,
-        default=None,
-        help="Output file path; defaults to <outdir>/q8020_metadata_<exp_id>.json",
-    )
-    parser.add_argument(
-        "--force", "-f",
-        action="store_true",
-        help="Overwrite existing metadata.json",
-    )
-    parser.add_argument(
-        "--clean",
-        action="store_true",
-        help="Remove fragment files after successful assembly",
+        metavar="DIR",
+        help=(
+            "Write assembled metadata to a separate directory instead of "
+            "the --source dir.  The source directory is never modified. "
+            "Fragments and rollup are written to --dest."
+        ),
     )
 
     args = parser.parse_args()
 
-    outdir = Path(args.outdir).expanduser().resolve()
-    if not outdir.exists():
-        print(f"Error: Directory does not exist: {outdir}", file=sys.stderr)
+    source = Path(args.source).expanduser().resolve()
+    if not source.exists():
+        print(f"Error: Directory does not exist: {source}", file=sys.stderr)
         sys.exit(1)
 
-    # Run solver-specific harvester if specified
-    experiment_id = None
-    if args.harvester:
+    dest_root: Path | None = None
+    if args.dest:
+        dest_root = Path(args.dest).expanduser().resolve()
+        dest_root.mkdir(parents=True, exist_ok=True)
+
+    # Discover case dirs recursively.
+    case_dirs, no_meta_dirs = _walk_case_dirs(source)
+
+    # If source itself is a case dir, case_dirs will contain just it.
+    # If nothing found, treat source as a single (possibly empty) case dir.
+    if not case_dirs and not no_meta_dirs:
+        case_dirs = [source]
+
+    n_harvested = 0
+    n_skipped = 0
+    for case_dir in case_dirs:
+        # Build per-case dest dir preserving relative structure.
+        if dest_root is not None:
+            rel = case_dir.relative_to(source) if case_dir != source else Path(case_dir.name)
+            case_dest = dest_root / rel
+        else:
+            case_dest = None
+
         try:
-            experiment_id = run_solver_harvester(outdir, args.harvester)
-            print(f"🔧 Ran {args.harvester} harvester (exp_id: {experiment_id})", file=sys.stderr)
-        except (ImportError, AttributeError) as e:
-            print(f"Error: {e}", file=sys.stderr)
-            sys.exit(1)
+            out = _harvest_one(case_dir, dest_dir=case_dest, harvester_path=args.harvester)
+            n_harvested += 1
+            print(f"✅ {case_dir.name} → {out}", file=sys.stderr)
+        except Exception as e:
+            n_skipped += 1
+            print(f"❌ {case_dir.name}: {e}", file=sys.stderr)
 
-    # Determine output path
-    if args.output:
-        output_path = Path(args.output)
-    elif experiment_id:
-        output_path = outdir / f"q8020_metadata_{experiment_id}.json"
-    else:
-        output_path = outdir / "metadata.json"
+    if no_meta_dirs:
+        print(f"\n⚠️  {len(no_meta_dirs)} dirs with fragments but no assembled metadata", file=sys.stderr)
 
-    if output_path.exists() and not args.force:
-        print(
-            f"Error: {output_path} already exists. Use --force to overwrite.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-    # Harvest fragments
-    metadata, warnings, fragment_counts = harvest_metadata(outdir)
-
-    # Print warnings
-    for warning in warnings:
-        print(f"⚠️  {warning}", file=sys.stderr)
-
-    # Print fragment counts
-    print("📊 Fragments found:", file=sys.stderr)
-    for section in VALID_SECTIONS:
-        count = fragment_counts.get(section, 0)
-        if count > 0:
-            print(f"   {section}: {count}", file=sys.stderr)
-
-    # Write output
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(metadata, f, indent=2)
-
-    print(f"✅ Metadata written to: {output_path}", file=sys.stderr)
-
-    # Clean up fragments if requested
-    if args.clean:
-        fragment_files = get_fragment_files(outdir)
-        for filepath in fragment_files:
-            filepath.unlink()
-        print(f"🧹 Removed {len(fragment_files)} fragment files", file=sys.stderr)
+    print(f"\n📊 {n_harvested} harvested, {n_skipped} skipped", file=sys.stderr)
 
 
 if __name__ == "__main__":
