@@ -159,6 +159,33 @@ def get_fragment_files(outdir: Path) -> list[Path]:
     return fragment_files
 
 
+def _walk_leaf_dirs(root: Path) -> list[Path]:
+    """Return all leaf directories under *root* (dirs with no subdirectories).
+
+    Used when ``--harvester`` is specified on a fresh directory tree that has
+    no existing metadata or fragment files.  Leaf dirs are assumed to be
+    individual case directories containing solver artifacts.
+    """
+    root = root.expanduser().resolve()
+    leaves: list[Path] = []
+
+    def _recurse(d: Path) -> None:
+        try:
+            children = sorted(d.iterdir())
+        except PermissionError:
+            return
+        subdirs = [c for c in children if c.is_dir()]
+        if not subdirs:
+            # Leaf directory
+            leaves.append(d)
+        else:
+            for sd in subdirs:
+                _recurse(sd)
+
+    _recurse(root)
+    return leaves
+
+
 def _copy_fragments(src: Path, dest: Path) -> None:
     """Copy existing q8020 fragment files from *src* to *dest*."""
     for p in src.iterdir():
@@ -361,8 +388,18 @@ def main() -> None:
     # Discover case dirs recursively.
     case_dirs, no_meta_dirs = _walk_case_dirs(source)
 
-    # If source itself is a case dir, case_dirs will contain just it.
-    # If nothing found, treat source as a single (possibly empty) case dir.
+    # If nothing found and a harvester is specified, fall back to leaf-dir
+    # discovery (first-time harvest on a tree with no existing fragments).
+    if not case_dirs and not no_meta_dirs and args.harvester:
+        case_dirs = _walk_leaf_dirs(source)
+        if case_dirs:
+            print(
+                f"ℹ️  No metadata/fragments found; discovered {len(case_dirs)} "
+                f"leaf dirs for harvesting.",
+                file=sys.stderr,
+            )
+
+    # If still nothing, treat source as a single case dir.
     if not case_dirs and not no_meta_dirs:
         case_dirs = [source]
 
