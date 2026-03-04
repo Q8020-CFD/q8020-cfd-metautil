@@ -347,6 +347,161 @@ def _make_code_section(
 
 
 # ---------------------------------------------------------------------------
+# Multi-stage helpers
+# ---------------------------------------------------------------------------
+
+import re
+
+_STAGE_VAR_PATTERN = re.compile(r"\{\{stages\.(\w+)\.(\w+)\}\}")
+
+
+def _parse_stages(
+    data: dict[str, Any],
+    outer_global: dict[str, Any],
+) -> list[tuple[str, dict[str, Any], dict[str, Any]]] | None:
+    """Parse ``[stage.<name>]`` sections from raw TOML data.
+
+    If the TOML contains no ``stage`` key the function returns ``None``
+    (backward-compatible single-stage config).  Otherwise it returns an
+    ordered list of ``(stage_name, stage_global_params, stage_groups)``
+    tuples.  Each stage's parameters are merged with *outer_global* as
+    defaults (stage-level scalars override, groups override further).
+
+    Args:
+        data: Raw dict from ``tomllib.load()``.
+        outer_global: The ``[global]`` section parameters.
+
+    Returns:
+        Ordered list of stage tuples, or None if no stages defined.
+    """
+    if "stage" not in data:
+        return None
+
+    raw_stages = data["stage"]
+    if not isinstance(raw_stages, dict) or not raw_stages:
+        return None
+
+    stages: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
+
+    for stage_name, stage_data in raw_stages.items():
+        if not isinstance(stage_data, dict):
+            continue
+
+        # Validate stage name (must work in {{stages.<name>.prop}} syntax)
+        if not re.match(r"^\w+$", stage_name):
+            raise ValueError(
+                f"Stage name '{stage_name}' contains invalid characters. "
+                f"Stage names must be alphanumeric/underscores only."
+            )
+
+        # Separate scalar keys (stage-level params) from dict keys (groups)
+        stage_global = outer_global.copy()
+        stage_groups_raw: dict[str, dict[str, Any]] = {}
+
+        for k, v in stage_data.items():
+            if isinstance(v, dict):
+                stage_groups_raw[k] = v
+            else:
+                stage_global[k] = v
+
+        # Expand groups using the same logic as load_sweep_config
+        groups: dict[str, Any] = {}
+        for gid, gparams in stage_groups_raw.items():
+            expanded = expand_case_lists(gid, gparams)
+            expanded_cases: dict[str, dict[str, Any]] = {}
+            for eid, ep in expanded:
+                merged = stage_global.copy()
+                merged.update(ep)
+                expanded_cases[eid] = merged
+
+            group_params = stage_global.copy()
+            group_params.update(gparams)
+            groups[gid] = {
+                "params": group_params,
+                "expanded_cases": expanded_cases,
+            }
+
+        stages.append((stage_name, stage_global, groups))
+
+    return stages if stages else None
+
+
+def _substitute_stage_vars(
+    params: dict[str, Any],
+    stage_context: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Return a new dict with ``{{stages.<name>.<prop>}}`` placeholders resolved.
+
+    Only string values (and strings inside lists) are scanned for
+    placeholders.  All other value types are passed through unchanged.
+
+    Args:
+        params: Parameter dict (not mutated).
+        stage_context: Mapping of completed stage names to their
+            context dicts (e.g. ``{"run_dir": "/path", ...}``).
+
+    Raises:
+        ValueError: If a placeholder references an unknown stage or property.
+    """
+    def _replacer(m: re.Match) -> str:
+        sname, prop = m.group(1), m.group(2)
+        if sname not in stage_context:
+            raise ValueError(
+                f"Stage variable '{{{{stages.{sname}.{prop}}}}}' references "
+                f"unknown stage '{sname}'. "
+                f"Completed stages: {list(stage_context.keys())}"
+            )
+        ctx = stage_context[sname]
+        if prop not in ctx:
+            raise ValueError(
+                f"Stage variable '{{{{stages.{sname}.{prop}}}}}' references "
+                f"unknown property '{prop}'. "
+                f"Available: {list(ctx.keys())}"
+            )
+        return str(ctx[prop])
+
+    result: dict[str, Any] = {}
+    for k, v in params.items():
+        if isinstance(v, str) and "{{stages." in v:
+            result[k] = _STAGE_VAR_PATTERN.sub(_replacer, v)
+        elif isinstance(v, list):
+            result[k] = [
+                _STAGE_VAR_PATTERN.sub(_replacer, item)
+                if isinstance(item, str) and "{{stages." in item
+                else item
+                for item in v
+            ]
+        else:
+            result[k] = v
+    return result
+
+
+def _substitute_stage_vars_in_groups(
+    groups: dict[str, Any],
+    stage_context: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Apply stage variable substitution across all groups and their cases.
+
+    Returns a new groups dict — the original is not mutated.
+    """
+    resolved: dict[str, Any] = {}
+    for gid, gdata in groups.items():
+        resolved_params = _substitute_stage_vars(
+            gdata["params"], stage_context,
+        )
+        resolved_expanded: dict[str, dict[str, Any]] = {}
+        for eid, ep in gdata["expanded_cases"].items():
+            resolved_expanded[eid] = _substitute_stage_vars(
+                ep, stage_context,
+            )
+        resolved[gid] = {
+            "params": resolved_params,
+            "expanded_cases": resolved_expanded,
+        }
+    return resolved
+
+
+# ---------------------------------------------------------------------------
 # Single case execution
 # ---------------------------------------------------------------------------
 
@@ -433,12 +588,6 @@ def run_single(
     with open(params_file, "w", encoding="utf-8") as f:
         json.dump(params_data, f, indent=2)
 
-    # Append ID args to command so script knows its IDs
-    command_with_ids = command + [
-        "--experiment-id", experiment_id,
-        "--workflow-id", workflow_id,
-    ]
-
     t_pre_seconds = time.perf_counter() - t_pre_start
 
     # Record start time
@@ -447,7 +596,7 @@ def run_single(
 
     # Base result dict (updated on success/failure)
     result_dict: dict[str, Any] = {
-        "command": command_with_ids,
+        "command": command,
         "case_id": case_id,
         "experiment_id": experiment_id,
         "output_dir": str(case_dir),
@@ -456,7 +605,7 @@ def run_single(
     try:
         # Run the command, capturing stdout and stderr while also echoing to console
         result = subprocess_tee.run(
-            command_with_ids,
+            command,
             check=False,
             timeout=timeout,
         )
@@ -495,7 +644,7 @@ def run_single(
             timestamp=start_time,
         )
         case_section = _make_case_section(
-            command=command_with_ids,
+            command=command,
             cwd=cwd,
             case_id=case_id,
             case_params=case_params,
@@ -537,7 +686,7 @@ def run_single(
             timestamp=start_time,
         )
         case_section = _make_case_section(
-            command=command_with_ids, cwd=cwd, case_id=case_id, case_params=case_params
+            command=command, cwd=cwd, case_id=case_id, case_params=case_params
         )
         write_experiment(case_dir, experiment_section, prefix="q8020_sweep", experiment_id=experiment_id)
         write_case(case_dir, case_section, prefix="q8020_sweep", experiment_id=experiment_id)
@@ -570,7 +719,7 @@ def run_single(
             timestamp=start_time,
         )
         case_section = _make_case_section(
-            command=command_with_ids, cwd=cwd, case_id=case_id, case_params=case_params
+            command=command, cwd=cwd, case_id=case_id, case_params=case_params
         )
         write_experiment(case_dir, experiment_section, prefix="q8020_sweep", experiment_id=experiment_id)
         write_case(case_dir, case_section, prefix="q8020_sweep", experiment_id=experiment_id)
@@ -602,7 +751,7 @@ def run_single(
 
     # Write code fragment with both env snapshots
     code_section = _make_code_section(
-        command=command_with_ids,
+        command=command,
         env_before=env_before,
         env_after=env_after,
     )
@@ -714,11 +863,6 @@ def run_case_pipeline(
     with open(params_file, "w", encoding="utf-8") as f:
         json.dump(params_data, f, indent=2)
 
-    # append IDs to command
-    command_with_ids = cmd + [
-        "--experiment-id", experiment_id,
-        "--workflow-id", workflow_id,
-    ]
     t_pre_seconds = time.perf_counter() - t_pre_start
 
     start_time = _get_iso_timestamp()
@@ -728,7 +872,7 @@ def run_case_pipeline(
         with open(stdout_file, "w", encoding="utf-8") as fout, \
              open(stderr_file, "w", encoding="utf-8") as ferr:
             proc_result = subprocess.run(
-                command_with_ids,
+                cmd,
                 stdout=fout,
                 stderr=ferr,
                 check=False,
@@ -792,7 +936,7 @@ def run_case_pipeline(
         timestamp=start_time,
     )
     case_section = _make_case_section(
-        command=command_with_ids, cwd=cwd,
+        command=cmd, cwd=cwd,
         case_id=case_id, case_params=case_params,
     )
     artifacts_section = _inventory_artifacts(case_dir)
@@ -831,7 +975,7 @@ def run_case_pipeline(
         json.dump(env_after, f, indent=2)
 
     code_section = _make_code_section(
-        command=command_with_ids,
+        command=cmd,
         env_before=env_before,
         env_after=env_after,
     )
@@ -878,7 +1022,7 @@ def run_case_pipeline(
     t_harvest = time.perf_counter() - t_harvest_start
 
     result["output_dir"] = str(case_dir)
-    result["command"] = command_with_ids
+    result["command"] = cmd
     result["overhead"] = {
         "pre_seconds": round(t_pre_seconds, 6),
         "post_seconds": round(t_post_seconds, 6),
@@ -1097,8 +1241,13 @@ def _generate_sbatch_script(
     cases_info: list[dict[str, Any]],
     global_params: dict[str, Any],
     run_dir: Path,
+    dependency_job_id: str | None = None,
 ) -> str:
     """Generate a single sbatch script that runs all cases in parallel.
+
+    Args:
+        dependency_job_id: If provided, adds ``#SBATCH --dependency=afterok:<id>``
+            so this job waits for the specified job to complete successfully.
 
     Returns the sbatch script content as a string.
     """
@@ -1158,6 +1307,10 @@ echo ""
 # No _slurm_conda_archive specified -- using default environment
 """
 
+    dependency_line = ""
+    if dependency_job_id:
+        dependency_line = f"#SBATCH --dependency=afterok:{dependency_job_id}\n"
+
     script = f"""\
 #!/bin/bash
 #SBATCH -J q8020_sweep
@@ -1168,7 +1321,7 @@ echo ""
 #SBATCH -p {partition}
 #SBATCH -o {run_dir}/slurm_%j.out
 #SBATCH -e {run_dir}/slurm_%j.err
-
+{dependency_line}
 echo "Job ID: $SLURM_JOB_ID"
 echo "Nodes:  $SLURM_JOB_NUM_NODES"
 echo "Cases:  {n_cases}"
@@ -1234,19 +1387,40 @@ def _collect_parallel_cases(
     return results, cases_info
 
 
+def _parse_slurm_job_id(stdout: str) -> str | None:
+    """Extract job ID from sbatch stdout (e.g. 'Submitted batch job 12345')."""
+    match = re.search(r"Submitted batch job (\d+)", stdout)
+    if match:
+        return match.group(1)
+    # Fallback: last numeric token
+    for word in reversed(stdout.strip().split()):
+        if word.isdigit():
+            return word
+    return None
+
+
 def _finalize_slurm(
     all_cases_info: list[dict[str, Any]],
     all_results: dict[str, Any],
     global_params: dict[str, Any],
     run_dir: Path,
     dry_run: bool = False,
-) -> None:
+    dependency_job_id: str | None = None,
+) -> str | None:
     """Generate one sbatch script for all collected cases.
 
     Mutates all_results in place to update status.
+
+    Args:
+        dependency_job_id: If provided, the generated sbatch script will
+            include ``--dependency=afterok:<id>`` so it waits for that job.
+
+    Returns:
+        The SLURM job ID if successfully submitted, otherwise ``None``.
     """
     sbatch_content = _generate_sbatch_script(
         all_cases_info, global_params, run_dir,
+        dependency_job_id=dependency_job_id,
     )
     sbatch_file = run_dir / "q8020_sweep.sbatch"
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -1261,7 +1435,7 @@ def _finalize_slurm(
     )
 
     if dry_run:
-        return
+        return None
 
     slurm_submit = global_params.get("_slurm_submit", False)
     if slurm_submit:
@@ -1275,9 +1449,11 @@ def _finalize_slurm(
             print(
                 f"{GREEN}{BOLD}Submitted:{RESET} {job_line}"
             )
+            job_id = _parse_slurm_job_id(job_line)
             for eid in all_results:
                 all_results[eid]["status"] = "submitted"
                 all_results[eid]["slurm_output"] = job_line
+            return job_id
         except Exception as e:
             print(
                 f"{RED}{BOLD}sbatch failed:{RESET} {e}",
@@ -1286,12 +1462,18 @@ def _finalize_slurm(
             for eid in all_results:
                 all_results[eid]["status"] = "submit_error"
                 all_results[eid]["error"] = str(e)
+            return None
     else:
+        if dependency_job_id:
+            print(
+                f"\n  {DIM}(depends on job {dependency_job_id}){RESET}"
+            )
         print(
             f"\nTo submit: {BOLD}sbatch {sbatch_file}{RESET}"
         )
         for eid in all_results:
             all_results[eid]["status"] = "generated"
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -1380,10 +1562,17 @@ def load_sweep_config(toml_path: str) -> dict:
 
     # Support both "global" and "_global" as section names
     global_params = data.get("global", data.get("_global", {}))
+
+    # Check for multi-stage configuration ([stage.<name>] sections)
+    stages = _parse_stages(data, global_params)
+    if stages is not None:
+        return {"global": global_params, "groups": {}, "stages": stages}
+
+    # Single-stage: every non-global section is a group
     groups = {}  # original_case_id -> {params, expanded_cases}
 
     for key in data:
-        if key in ("global", "_global"):
+        if key in ("global", "_global", "stage"):
             continue
 
         # Expand this case
@@ -1556,13 +1745,23 @@ def run_sweep(
     dry_run: bool = False,
     group_filter: list = None,
     overrides: dict[str, str] | None = None,
+    *,
+    _preloaded_config: dict | None = None,
+    _dependency_job_id: str | None = None,
+    _run_dir_override: Path | None = None,
+    _workflow_id_override: str | None = None,
 ) -> dict:
     """Run a parameter sweep from a TOML configuration file.
 
     Args:
         overrides: CLI --set overrides applied to [global].
+        _preloaded_config: If provided, skip TOML loading and use this config
+            directly.  Used internally by the multi-stage orchestrator.
+        _dependency_job_id: SLURM job ID that this sweep must wait for.
+        _run_dir_override: Use this run directory instead of generating one.
+        _workflow_id_override: Use this workflow ID instead of generating one.
     """
-    config = load_sweep_config(toml_path)
+    config = _preloaded_config or load_sweep_config(toml_path)
     global_params = config["global"]
 
     # Apply CLI overrides to global params
@@ -1626,8 +1825,12 @@ def run_sweep(
         date_dir.mkdir(parents=True, exist_ok=True)
     
     # Create run subdirectory with workflow ID under date dir
-    workflow_id = generate_workflow_id()
-    run_dir = date_dir / workflow_id
+    if _run_dir_override is not None:
+        workflow_id = _workflow_id_override or generate_workflow_id()
+        run_dir = _run_dir_override
+    else:
+        workflow_id = generate_workflow_id()
+        run_dir = date_dir / workflow_id
     
     # Count total cases across all groups
     total_cases = sum(len(g["expanded_cases"]) for g in groups.values())
@@ -2066,12 +2269,14 @@ def run_sweep(
         print()
 
     # Launch all parallel cases after groups are collected
+    slurm_job_id = None
     if run_mode == "parallel" and parallel_all_cases_info:
         if use_slurm:
-            _finalize_slurm(
+            slurm_job_id = _finalize_slurm(
                 parallel_all_cases_info,
                 parallel_all_results,
                 global_params, run_dir, dry_run,
+                dependency_job_id=_dependency_job_id,
             )
         else:
             _finalize_local_parallel(
@@ -2130,6 +2335,8 @@ def run_sweep(
     # Record sweep end time and save overall results
     sweep_end_time = _get_iso_timestamp()
     results["end_time"] = sweep_end_time
+    if slurm_job_id:
+        results["slurm_job_id"] = slurm_job_id
 
     if not dry_run:
         results_file = run_dir / f"q8020_sweep_meta{workflow_id}.json"
@@ -2138,6 +2345,154 @@ def run_sweep(
         print(f"{CYAN}{BOLD}Results saved to:{RESET} {results_file}")
 
     return results
+
+
+# ---------------------------------------------------------------------------
+# Multi-stage orchestration
+# ---------------------------------------------------------------------------
+
+def _run_multi_stage_sweep(
+    toml_path: str,
+    outer_global: dict[str, Any],
+    stages: list[tuple[str, dict[str, Any], dict[str, Any]]],
+    script: str | None,
+    dry_run: bool = False,
+    group_filter: list | None = None,
+    overrides: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Run a multi-stage sweep where each stage executes after the previous.
+
+    For SLURM jobs, stages are chained via ``--dependency=afterok:<id>``.
+    For local execution, stages run sequentially in-process.
+
+    A non-SLURM stage following a SLURM stage raises ``ValueError``
+    because the local process cannot block on a queued SLURM job.
+
+    Args:
+        toml_path: Path to TOML config (for metadata only).
+        outer_global: The top-level ``[global]`` parameters.
+        stages: Ordered list of ``(name, stage_global, stage_groups)``.
+        script: CLI-provided script override (may be None).
+        dry_run: If True, print commands without executing.
+        group_filter: Optional group name filter (applied within each stage).
+        overrides: CLI ``--set`` overrides.
+
+    Returns:
+        Combined results dict with per-stage sub-results.
+    """
+    # Shared workflow ID and base run directory for all stages
+    workflow_id = generate_workflow_id()
+    output_dir_str = outer_global.get("_output_dir", "./sweep_results")
+    output_dir = Path(output_dir_str).expanduser().resolve()
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    date_dir = output_dir / date_str
+    base_run_dir = date_dir / workflow_id
+
+    if not dry_run:
+        base_run_dir.mkdir(parents=True, exist_ok=True)
+        # Copy input TOML to base run directory
+        toml_name = Path(toml_path).name
+        shutil.copy2(toml_path, base_run_dir / f"q8020_{toml_name}")
+
+    print(
+        f"{CYAN}{BOLD}Multi-stage sweep:{RESET}"
+        f" {len(stages)} stages"
+    )
+    print(f"{CYAN}{BOLD}Output directory:{RESET} {base_run_dir}")
+    for i, (sname, _, sgroups) in enumerate(stages, 1):
+        n = sum(len(g["expanded_cases"]) for g in sgroups.values())
+        print(f"  Stage {i}: {sname} ({n} cases)")
+    print()
+
+    stage_context: dict[str, dict[str, Any]] = {}
+    all_stage_results: dict[str, Any] = {
+        "config_file": str(toml_path),
+        "output_dir": str(output_dir),
+        "workflow_id": workflow_id,
+        "run_dir": str(base_run_dir),
+        "start_time": _get_iso_timestamp(),
+        "stages": {},
+    }
+    prev_job_id: str | None = None
+
+    for stage_name, stage_global, stage_groups in stages:
+        print(
+            f"{CYAN}{BOLD}{'=' * 60}{RESET}"
+        )
+        print(
+            f"{CYAN}{BOLD}Stage: {stage_name}{RESET}"
+        )
+        print(
+            f"{CYAN}{BOLD}{'=' * 60}{RESET}"
+        )
+
+        # Substitute {{stages.X.Y}} placeholders
+        resolved_global = _substitute_stage_vars(
+            stage_global, stage_context,
+        )
+        resolved_groups = _substitute_stage_vars_in_groups(
+            stage_groups, stage_context,
+        )
+
+        # Validate: non-SLURM stage after SLURM stage is invalid
+        use_slurm = bool(resolved_global.get("_slurm", False))
+        if prev_job_id and not use_slurm:
+            raise ValueError(
+                f"Stage '{stage_name}' uses local execution mode "
+                f"but follows a SLURM stage. All stages after a "
+                f"SLURM stage must also use _slurm = true, because "
+                f"a local process cannot wait for a queued SLURM job."
+            )
+
+        stage_run_dir = base_run_dir / stage_name
+
+        # Build a synthetic config dict for run_sweep
+        stage_config = {
+            "global": resolved_global,
+            "groups": resolved_groups,
+        }
+
+        # Determine script for this stage
+        stage_script = resolved_global.get("_script") or script
+
+        stage_results = run_sweep(
+            toml_path=toml_path,
+            script=stage_script,
+            dry_run=dry_run,
+            group_filter=group_filter,
+            overrides=overrides,
+            _preloaded_config=stage_config,
+            _dependency_job_id=prev_job_id,
+            _run_dir_override=stage_run_dir,
+            _workflow_id_override=workflow_id,
+        )
+
+        # Track stage context for variable substitution
+        job_id = stage_results.get("slurm_job_id")
+        stage_context[stage_name] = {
+            "run_dir": str(stage_run_dir),
+            "slurm_job_id": job_id or "",
+        }
+        if job_id:
+            prev_job_id = job_id
+
+        all_stage_results["stages"][stage_name] = stage_results
+        print()
+
+    all_stage_results["end_time"] = _get_iso_timestamp()
+
+    if not dry_run:
+        results_file = (
+            base_run_dir / f"q8020_sweep_meta{workflow_id}.json"
+        )
+        with open(results_file, "w", encoding="utf-8") as f:
+            json.dump(all_stage_results, f, indent=2)
+        print(
+            f"{CYAN}{BOLD}Multi-stage results saved to:"
+            f"{RESET} {results_file}"
+        )
+
+    return all_stage_results
 
 
 # *****************************************************************************
@@ -2200,33 +2555,65 @@ Usage:
     group_filter = args.groups if args.groups else None
 
     try:
-        # Read _script from TOML (may be overridden)
-        with open(args.toml_file, "rb") as f:
-            toml_data = tomllib.load(f)
-            global_sect = toml_data.get(
-                "global", toml_data.get("_global", {})
-            )
-            script = overrides.get(
-                "_script",
-                global_sect.get("_script"),
-            )
-
-        results = run_sweep(
-            args.toml_file, script,
-            dry_run=args.dry_run,
-            group_filter=group_filter,
-            overrides=overrides,
+        # Load config to check for multi-stage
+        config = load_sweep_config(args.toml_file)
+        global_sect = config["global"]
+        script = overrides.get(
+            "_script",
+            global_sect.get("_script"),
         )
 
-        # Print summary
-        print(f"\n{CYAN}{BOLD}=== Summary ==={RESET}")
-        total = len(results["cases"])
-        success = sum(
-            1 for c in results["cases"].values() if c.get("status") == "success"
-        )
-        failed = total - success
-        failed_str = f"{RED}{BOLD}Failed:{RESET} {failed}" if failed > 0 else f"Failed: {failed}"
-        print(f"{BOLD}Total:{RESET} {total}, {GREEN}{BOLD}Success:{RESET} {success}, {failed_str}")
+        if "stages" in config:
+            # Multi-stage sweep
+            results = _run_multi_stage_sweep(
+                toml_path=args.toml_file,
+                outer_global=global_sect,
+                stages=config["stages"],
+                script=script,
+                dry_run=args.dry_run,
+                group_filter=group_filter,
+                overrides=overrides,
+            )
+
+            # Print multi-stage summary
+            print(f"\n{CYAN}{BOLD}=== Multi-Stage Summary ==={RESET}")
+            for sname, sresults in results.get("stages", {}).items():
+                cases = sresults.get("cases", {})
+                total = len(cases)
+                success = sum(
+                    1 for c in cases.values()
+                    if c.get("status") == "success"
+                )
+                dry = sum(
+                    1 for c in cases.values()
+                    if c.get("status") == "dry_run"
+                )
+                failed = total - success - dry
+                if dry == total:
+                    status_str = f"{DIM}dry run{RESET}"
+                elif failed == 0:
+                    status_str = f"{GREEN}all passed{RESET}"
+                else:
+                    status_str = f"{RED}{failed} failed{RESET}"
+                print(f"  {sname}: {total} cases, {status_str}")
+        else:
+            # Single-stage sweep (existing behavior)
+            results = run_sweep(
+                args.toml_file, script,
+                dry_run=args.dry_run,
+                group_filter=group_filter,
+                overrides=overrides,
+            )
+
+            # Print summary
+            print(f"\n{CYAN}{BOLD}=== Summary ==={RESET}")
+            total = len(results["cases"])
+            success = sum(
+                1 for c in results["cases"].values() if c.get("status") == "success"
+            )
+            failed = total - success
+            failed_str = f"{RED}{BOLD}Failed:{RESET} {failed}" if failed > 0 else f"Failed: {failed}"
+            print(f"{BOLD}Total:{RESET} {total}, {GREEN}{BOLD}Success:{RESET} {success}, {failed_str}")
 
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)

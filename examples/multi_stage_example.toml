@@ -1,0 +1,59 @@
+# Multi-stage sweep example
+#
+# Stages execute in declaration order. Each stage is an independent sweep
+# that runs after the previous stage completes.
+#
+# For SLURM mode, stages are chained via --dependency=afterok:<job_id>.
+# For local mode, stages run sequentially in-process.
+#
+# Use {{stages.<name>.run_dir}} to reference a completed stage's output
+# directory from a later stage.
+
+[global]
+_output_dir = "~/q8020"
+
+# ── Stage 1: Generate meshes ─────────────────────────────────────────────
+[stage.mesh]
+_script = "python ./mesh_generator.py"
+_run_mode = "sequential"
+_inject_outdir = "-outdir"
+
+[stage.mesh.coarse]
+"-nx" = 10
+
+[stage.mesh.fine]
+"-nx" = 50
+
+# ── Stage 2: Run solver on each mesh ─────────────────────────────────────
+# This stage waits for stage 1 to complete before starting.
+# The solver reads meshes from stage 1's output directory.
+[stage.solve]
+_script = "python ./fvm_euler_1d_solver/nozzle_1d_solver.py"
+_run_mode = "parallel"
+_inject_outdir = "-outdir"
+"-mesh_dir" = "{{stages.mesh.run_dir}}"
+"-linsolver" = "HHL"
+"-localdt" = true
+"-noshow" = true
+"-iters" = 4
+"-initers" = 1
+
+[stage.solve.ideal]
+
+[stage.solve.shots_1024]
+"-shots" = 1024
+
+# ── Stage 3 (SLURM example, commented out) ───────────────────────────────
+# Uncomment to run on a SLURM cluster with job dependency chaining:
+#
+# [stage.solve_hpc]
+# _script = "python ./fvm_euler_1d_solver/nozzle_1d_solver.py"
+# _run_mode = "parallel"
+# _slurm = true
+# _slurm_project = "CFD154"
+# _slurm_walltime = "02:00:00"
+# _slurm_submit = true
+# _inject_outdir = "-outdir"
+# "-mesh_dir" = "{{stages.mesh.run_dir}}"
+# "-linsolver" = "HHL"
+# "-shots" = [1024, 10000]

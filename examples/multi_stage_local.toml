@@ -1,0 +1,37 @@
+# Local multi-stage smoke test
+#
+# Runs nozzle_1d_solver.py twice sequentially to verify that
+# multi-stage chaining works for local execution and that
+# stage 2 can see stage 1's output directory via variable substitution.
+
+[global]
+_output_dir = "~/q8020"
+
+# ── Stage 1: coarse classical solve ──────────────────────────────────────
+[stage.coarse]
+_script = "python ./fvm_euler_1d_solver/nozzle_1d_solver.py"
+_run_mode = "sequential"
+_inject_outdir = "-outdir"
+"-nelem" = 5
+"-linsolver" = "LU"
+"-iters" = 4
+"-initers" = 1
+"-localdt" = true
+"-noshow" = true
+
+[stage.coarse.default]
+
+# ── Stage 2: fine classical solve (depends on stage 1) ───────────────────
+# Uses {{stages.coarse.run_dir}} so you can verify the variable resolves.
+[stage.fine]
+_script = "python ./fvm_euler_1d_solver/nozzle_1d_solver.py"
+_run_mode = "sequential"
+_inject_outdir = "-outdir"
+"-nelem" = 10
+"-linsolver" = "LU"
+"-iters" = 4
+"-initers" = 1
+"-localdt" = true
+"-noshow" = true
+
+[stage.fine.default]
