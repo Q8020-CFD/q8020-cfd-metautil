@@ -1107,6 +1107,163 @@ def _build_case_launch_info(
     }
 
 
+def _finalize_slurm_interactive(
+    all_cases_info: list[dict[str, Any]],
+    all_results: dict[str, Any],
+    global_params: dict[str, Any],
+    dry_run: bool = False,
+) -> None:
+    """Launch all collected cases via srun within an active salloc allocation.
+
+    Requires an existing SLURM allocation (e.g. from ``salloc``).
+    Each case is launched as a separate ``srun`` job step and polled
+    until completion, similar to ``_finalize_local_parallel`` but
+    distributing work across allocated compute nodes.
+
+    Mutates all_results in place with final statuses.
+    """
+    if "SLURM_JOB_ID" not in os.environ:
+        if dry_run:
+            print(
+                f"  {YELLOW}Warning: SLURM_JOB_ID not found."
+                f" Interactive mode requires an active"
+                f" salloc allocation.{RESET}"
+            )
+        else:
+            raise RuntimeError(
+                "SLURM interactive mode requires an active salloc "
+                "allocation. No SLURM_JOB_ID found in environment. "
+                "Run 'salloc -A <project> -N <nodes> -t <time> "
+                "-p batch' first, then re-run q8020-sweep."
+            )
+
+    cores = int(global_params.get("_cores_per_task", 1))
+    poll_interval = float(global_params.get("_poll_interval", 2))
+
+    if dry_run:
+        for info in all_cases_info:
+            srun_cmd = [
+                "srun", "-n", "1", "-c", str(cores), "--exclusive",
+                sys.executable, "-m",
+                "q8020_cfd_metautil.sweep_worker",
+                str(info["args_file"]),
+            ]
+            print(
+                f"  {DIM}Would launch:{RESET}"
+                f" {' '.join(srun_cmd)}"
+            )
+        return
+
+    alloc_id = os.environ.get("SLURM_JOB_ID", "?")
+    print(
+        f"  {CYAN}Using salloc allocation:{RESET} {alloc_id}"
+    )
+
+    inflight: list[dict[str, Any]] = []
+
+    for info in all_cases_info:
+        srun_cmd = [
+            "srun", "-n", "1", "-c", str(cores), "--exclusive",
+            sys.executable, "-m",
+            "q8020_cfd_metautil.sweep_worker",
+            str(info["args_file"]),
+        ]
+
+        print(f"  {YELLOW}Launched:{RESET} {info['case_id']}"
+              f" ({info['experiment_id']})")
+
+        stdout_log = (
+            info["case_dir"] / "pipeline_stdout.txt"
+        )
+        stderr_log = (
+            info["case_dir"] / "pipeline_stderr.txt"
+        )
+        fout = open(stdout_log, "w", encoding="utf-8")
+        ferr = open(stderr_log, "w", encoding="utf-8")
+
+        proc = subprocess.Popen(
+            srun_cmd,
+            stdout=fout,
+            stderr=ferr,
+        )
+        inflight.append({
+            "proc": proc,
+            "info": info,
+            "start_time": time.time(),
+            "fout": fout,
+            "ferr": ferr,
+        })
+
+    # Poll loop
+    total = len(inflight)
+    completed = 0
+    failed = 0
+
+    print(
+        f"\n  {CYAN}Waiting for {total} cases"
+        f" (srun interactive)...{RESET}\n",
+        flush=True,
+    )
+
+    remaining = list(inflight)
+    while remaining:
+        for entry in remaining[:]:
+            proc = entry["proc"]
+            ret = proc.poll()
+            if ret is None:
+                continue
+
+            remaining.remove(entry)
+            entry["fout"].close()
+            entry["ferr"].close()
+            info = entry["info"]
+            elapsed = time.time() - entry["start_time"]
+            eid = info["experiment_id"]
+            cid = info["case_id"]
+
+            result_file = (
+                info["case_dir"] / "pipeline_result.json"
+            )
+            if result_file.exists():
+                with open(result_file, encoding="utf-8") as f:
+                    case_result = json.load(f)
+            else:
+                case_result = {
+                    "case_id": cid,
+                    "experiment_id": eid,
+                    "status": "error",
+                    "returncode": ret,
+                    "output_dir": str(info["case_dir"]),
+                }
+
+            all_results[eid] = case_result
+
+            if ret == 0:
+                completed += 1
+                mins = int(elapsed // 60)
+                secs = elapsed % 60
+                print(
+                    f"  {GREEN}{BOLD}done:{RESET} {cid}"
+                    f" ({mins}m {secs:.0f}s)"
+                )
+            else:
+                failed += 1
+                print(
+                    f"  {RED}{BOLD}fail:{RESET} {cid}"
+                    f" (exit {ret})"
+                )
+
+            done = completed + failed
+            print(
+                f"       {done}/{total} "
+                f"({completed} ok, {failed} err)",
+                flush=True,
+            )
+
+        if remaining:
+            time.sleep(poll_interval)
+
+
 def _finalize_local_parallel(
     all_cases_info: list[dict[str, Any]],
     all_results: dict[str, Any],
@@ -1875,7 +2032,10 @@ def run_sweep(
 
     mode_label = run_mode
     if run_mode == "parallel" and use_slurm:
-        mode_label = "parallel (slurm)"
+        if global_params.get("_slurm_interactive"):
+            mode_label = "parallel (slurm interactive)"
+        else:
+            mode_label = "parallel (slurm)"
 
     print(
         f"{CYAN}{BOLD}Running sweep:{RESET}"
@@ -2271,7 +2431,13 @@ def run_sweep(
     # Launch all parallel cases after groups are collected
     slurm_job_id = None
     if run_mode == "parallel" and parallel_all_cases_info:
-        if use_slurm:
+        if use_slurm and global_params.get("_slurm_interactive"):
+            _finalize_slurm_interactive(
+                parallel_all_cases_info,
+                parallel_all_results,
+                global_params, dry_run,
+            )
+        elif use_slurm:
             slurm_job_id = _finalize_slurm(
                 parallel_all_cases_info,
                 parallel_all_results,
