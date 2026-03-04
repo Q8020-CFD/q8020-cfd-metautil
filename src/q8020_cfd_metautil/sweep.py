@@ -2611,9 +2611,15 @@ Usage:
             success = sum(
                 1 for c in results["cases"].values() if c.get("status") == "success"
             )
-            failed = total - success
-            failed_str = f"{RED}{BOLD}Failed:{RESET} {failed}" if failed > 0 else f"Failed: {failed}"
-            print(f"{BOLD}Total:{RESET} {total}, {GREEN}{BOLD}Success:{RESET} {success}, {failed_str}")
+            dry = sum(
+                1 for c in results["cases"].values() if c.get("status") == "dry_run"
+            )
+            failed = total - success - dry
+            if dry == total:
+                print(f"{BOLD}Total:{RESET} {total} ({DIM}dry run{RESET})")
+            else:
+                failed_str = f"{RED}{BOLD}Failed:{RESET} {failed}" if failed > 0 else f"Failed: {failed}"
+                print(f"{BOLD}Total:{RESET} {total}, {GREEN}{BOLD}Success:{RESET} {success}, {failed_str}")
 
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
