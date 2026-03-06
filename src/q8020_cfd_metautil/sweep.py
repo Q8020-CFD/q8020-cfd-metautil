@@ -1424,7 +1424,7 @@ def _generate_sbatch_script(
     for info in cases_info:
         worker = (
             f"srun -n 1 -c {cores} --exclusive "
-            f"python -m q8020_cfd_metautil.sweep_worker "
+            f"python3 -m q8020_cfd_metautil.sweep_worker "
             f"{info['args_file']} &"
         )
         srun_lines.append(worker)
@@ -1556,6 +1556,108 @@ def _parse_slurm_job_id(stdout: str) -> str | None:
     return None
 
 
+def _poll_slurm_job(
+    job_id: str,
+    all_results: dict[str, Any],
+    run_dir: Path,
+    poll_wait: float = 5,
+) -> None:
+    """Poll a submitted Slurm job briefly to catch instant failures.
+
+    Waits up to ``poll_wait`` seconds, checking ``sacct`` each second.
+    If the job finishes within that window, updates all_results with
+    the real outcome (success/failed) instead of leaving them as
+    'submitted'. Also reads pipeline_result.json from each case dir
+    if available.
+
+    If the job is still running after ``poll_wait``, leaves status as
+    'submitted' and returns.
+    """
+    terminal_states = {
+        "COMPLETED", "FAILED", "CANCELLED", "TIMEOUT",
+        "NODE_FAIL", "PREEMPTED", "OUT_OF_MEMORY",
+    }
+
+    for _ in range(int(poll_wait)):
+        time.sleep(1)
+        try:
+            result = subprocess.run(
+                ["sacct", "-j", job_id, "--format=State", "-n",
+                 "--parsable2", "--noheader"],
+                capture_output=True, text=True, timeout=5,
+            )
+        except Exception:
+            return
+
+        states = {
+            s.strip() for s in result.stdout.strip().split("\n")
+            if s.strip()
+        }
+        if not states:
+            continue
+
+        # If any state is still non-terminal, job is running
+        if not states.issubset(terminal_states):
+            continue
+
+        # Job finished — determine outcome
+        job_failed = "FAILED" in states
+        job_status = "slurm_failed" if job_failed else "slurm_completed"
+
+        # Try to read per-case results from pipeline_result.json
+        case_results_found = 0
+        for eid, info in all_results.items():
+            case_dir = Path(info.get("output_dir", ""))
+            result_file = case_dir / "pipeline_result.json"
+            if result_file.exists():
+                import json as _json
+                with open(result_file, encoding="utf-8") as f:
+                    case_result = _json.load(f)
+                info.update(case_result)
+                case_results_found += 1
+            else:
+                info["status"] = job_status
+
+        if job_failed:
+            # Read slurm stderr for diagnostics
+            err_files = list(run_dir.glob("slurm_*.err"))
+            err_msg = ""
+            for ef in err_files:
+                content = ef.read_text(encoding="utf-8").strip()
+                if content:
+                    err_msg = content[:500]
+                    break
+
+            if err_msg:
+                print(
+                    f"\n{RED}{BOLD}Job {job_id} failed:{RESET}"
+                )
+                for line in err_msg.split("\n")[:10]:
+                    print(f"  {DIM}{line}{RESET}")
+            else:
+                print(
+                    f"\n{RED}{BOLD}Job {job_id} failed{RESET}"
+                    f" (check compute node logs)"
+                )
+        else:
+            ok = sum(
+                1 for r in all_results.values()
+                if r.get("status") == "success"
+            )
+            total = len(all_results)
+            print(
+                f"\n{GREEN}{BOLD}Job {job_id} completed:{RESET}"
+                f" {ok}/{total} cases succeeded"
+            )
+        return
+
+    # Job still running after poll_wait — leave as submitted
+    print(
+        f"  {DIM}Job {job_id} still running"
+        f" (check with: sacct -j {job_id}){RESET}"
+    )
+
+
 def _finalize_slurm(
     all_cases_info: list[dict[str, Any]],
     all_results: dict[str, Any],
@@ -1610,6 +1712,17 @@ def _finalize_slurm(
             for eid in all_results:
                 all_results[eid]["status"] = "submitted"
                 all_results[eid]["slurm_output"] = job_line
+
+            # Brief poll to catch jobs that fail instantly
+            if job_id:
+                poll_wait = float(
+                    global_params.get("_slurm_poll_wait", 5)
+                )
+                _poll_slurm_job(
+                    job_id, all_results, run_dir,
+                    poll_wait,
+                )
+
             return job_id
         except Exception as e:
             print(
@@ -2750,13 +2863,19 @@ Usage:
                     1 for c in cases.values()
                     if c.get("status") == "success"
                 )
+                submitted = sum(
+                    1 for c in cases.values()
+                    if c.get("status") == "submitted"
+                )
                 dry = sum(
                     1 for c in cases.values()
                     if c.get("status") == "dry_run"
                 )
-                failed = total - success - dry
+                failed = total - success - submitted - dry
                 if dry == total:
                     status_str = f"{DIM}dry run{RESET}"
+                elif submitted > 0:
+                    status_str = f"{CYAN}submitted{RESET}"
                 elif failed == 0:
                     status_str = f"{GREEN}all passed{RESET}"
                 else:
@@ -2775,14 +2894,27 @@ Usage:
             print(f"\n{CYAN}{BOLD}=== Summary ==={RESET}")
             total = len(results["cases"])
             success = sum(
-                1 for c in results["cases"].values() if c.get("status") == "success"
+                1 for c in results["cases"].values()
+                if c.get("status") in ("success", "slurm_completed")
+            )
+            submitted = sum(
+                1 for c in results["cases"].values() if c.get("status") == "submitted"
+            )
+            generated = sum(
+                1 for c in results["cases"].values() if c.get("status") == "generated"
             )
             dry = sum(
                 1 for c in results["cases"].values() if c.get("status") == "dry_run"
             )
-            failed = total - success - dry
+            failed = total - success - submitted - generated - dry
             if dry == total:
                 print(f"{BOLD}Total:{RESET} {total} ({DIM}dry run{RESET})")
+            elif submitted > 0:
+                failed_str = f", {RED}{BOLD}Failed:{RESET} {failed}" if failed > 0 else ""
+                print(f"{BOLD}Total:{RESET} {total}, {CYAN}{BOLD}Submitted:{RESET} {submitted}{failed_str}")
+            elif generated > 0:
+                failed_str = f", {RED}{BOLD}Failed:{RESET} {failed}" if failed > 0 else ""
+                print(f"{BOLD}Total:{RESET} {total}, {YELLOW}Generated:{RESET} {generated}{failed_str}")
             else:
                 failed_str = f"{RED}{BOLD}Failed:{RESET} {failed}" if failed > 0 else f"Failed: {failed}"
                 print(f"{BOLD}Total:{RESET} {total}, {GREEN}{BOLD}Success:{RESET} {success}, {failed_str}")

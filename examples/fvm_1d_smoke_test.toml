@@ -1,19 +1,23 @@
 # FVM Euler 1D Solver - example invocation via q8020-sweeper 
 
 [global]
-_output_dir = "~/q8020"
+_slurm = true
+_run_mode = "parallel"
+_slurm_submit = true
+_slurm_project = "frontier_project"
+_output_dir = "/data/q8020"
 _env = "./fvm_euler_1d_solver/.venv"
 _script = """\
 source ./fvm_euler_1d_solver/.venv/bin/activate && \
-python ./fvm_euler_1d_solver/nozzle_1d_solver.py\
+python3 ./fvm_euler_1d_solver/nozzle_1d_solver.py\
 """
 _case_postproc = [
-    "python -m q8020_cfd_metautil.harvesters.fvm_euler_1d_solver_harvester"
+    "python ./q8020-cfd-experiments/codes/fvm_euler_1d_nozzle/fvm_euler_1d_solver_harvester.py"
 ]
 _inject_outdir = "-outdir"
-"-nelem" = 2
+"-nelem" = 200
 "-time_scheme" = "BDF1"
-"-linsolver" = "HHL"
+"-cfl" = "1e5"
 "-localdt" = true
 "-noshow" = true
 

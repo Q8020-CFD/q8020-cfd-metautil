@@ -1,0 +1,28 @@
+# Smoke test for q8020-cfd-metautil against local Slurm Docker cluster
+# (Frontier-like configuration: batch partition, nvme constraint, project account)
+#
+# Usage (from inside slurmctld container):
+#   cd /workspace
+#   python3 -m q8020_cfd_metautil.sweep q8020-cfd-metautil/examples/slurm_docker_smoke_test.toml
+
+[global]
+_slurm = true
+_run_mode = "parallel"
+_slurm_submit = true
+_slurm_project = "frontier_project"
+_slurm_walltime = "00:05:00"
+_slurm_partition = "batch"
+_cores_per_task = 1
+_output_dir = "/data/q8020_smoke_test"
+_script = """\
+python3 /workspace/q8020-cfd-metautil/examples/smoke_test_solver.py\
+"""
+
+[case_alpha]
+"-greeting" = "alpha"
+
+[case_beta]
+"-greeting" = "beta"
+
+[case_gamma]
+"-greeting" = "gamma"
