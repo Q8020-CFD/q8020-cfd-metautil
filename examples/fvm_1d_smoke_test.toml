@@ -12,7 +12,7 @@ source ./fvm_euler_1d_solver/.venv/bin/activate && \
 python3 ./fvm_euler_1d_solver/nozzle_1d_solver.py\
 """
 _case_postproc = [
-    "python ./q8020-cfd-experiments/codes/fvm_euler_1d_nozzle/fvm_euler_1d_solver_harvester.py"
+    "source ./fvm_euler_1d_solver/.venv/bin/activate && python3 ./q8020-cfd-experiments/codes/fvm_euler_1d_nozzle/fvm_euler_1d_solver_harvester.py"
 ]
 _inject_outdir = "-outdir"
 "-nelem" = 200

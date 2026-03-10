@@ -1152,6 +1152,8 @@ def _finalize_slurm_interactive(
                 f"  {DIM}Would launch:{RESET}"
                 f" {' '.join(srun_cmd)}"
             )
+        for eid in all_results:
+            all_results[eid]["status"] = "dry_run"
         return
 
     alloc_id = os.environ.get("SLURM_JOB_ID", "?")
@@ -1289,6 +1291,8 @@ def _finalize_local_parallel(
                 f"  {DIM}Would launch:{RESET}"
                 f" {' '.join(worker_cmd)}"
             )
+        for eid in all_results:
+            all_results[eid]["status"] = "dry_run"
         return
 
     inflight: list[dict[str, Any]] = []
@@ -1694,6 +1698,8 @@ def _finalize_slurm(
     )
 
     if dry_run:
+        for eid in all_results:
+            all_results[eid]["status"] = "dry_run"
         return None
 
     slurm_submit = global_params.get("_slurm_submit", False)
@@ -1953,8 +1959,8 @@ def run_postproc(
     for postproc_cmd in postproc_list:
         # Check if command contains shell operators (needs bash -c)
         if "&&" in postproc_cmd or "||" in postproc_cmd or "|" in postproc_cmd or "$(" in postproc_cmd or "`" in postproc_cmd:
-            # Shell command - wrap with bash -c, run as-is (no JSON path appended)
-            cmd = ["bash", "-c", postproc_cmd]
+            # Shell command - wrap with bash -c, append JSON path to the command string
+            cmd = ["bash", "-c", f"{postproc_cmd} {postproc_json}"]
         else:
             # Simple command - split and append JSON path as argument
             cmd = postproc_cmd.split() + [str(postproc_json)]

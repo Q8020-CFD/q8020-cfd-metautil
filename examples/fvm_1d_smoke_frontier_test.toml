@@ -1,0 +1,58 @@
+# FVM Euler 1D Solver - Frontier embarrassingly parallel sweep
+#
+# Designed for OLCF Frontier: packs many independent cases across nodes.
+# Each FVM solve is single-core (~5s), so 64 cases fit on 1 node.
+# List-valued parameters are auto-expanded into cross-product combinations.
+#
+# Usage:
+#   q8020-sweep fvm_1d_smoke_frontier_test.toml
+#   q8020-sweep fvm_1d_smoke_frontier_test.toml --dry-run
+
+[global]
+_slurm = true
+_run_mode = "parallel"
+_slurm_submit = true
+_slurm_project = "frontier_project"
+_slurm_partition = "batch"
+_slurm_walltime = "02:00:00"
+_cores_per_task = 1
+_output_dir = "/data/q8020"
+
+# Optional: broadcast packed conda env to NVMe burst buffer for fast imports
+# Create with: conda-pack -o packed_env.tar.gz
+# _slurm_conda_archive = "/path/to/packed_env.tar.gz"
+
+_env = "./fvm_euler_1d_solver/.venv"
+_script = """\
+source ./fvm_euler_1d_solver/.venv/bin/activate && \
+python3 ./fvm_euler_1d_solver/nozzle_1d_solver.py\
+"""
+_case_postproc = [
+    "source ./fvm_euler_1d_solver/.venv/bin/activate && python3 ./q8020-cfd-experiments/codes/fvm_euler_1d_nozzle/fvm_euler_1d_solver_harvester.py"
+]
+_inject_outdir = "-outdir"
+"-time_scheme" = "BDF1"
+"-cfl" = "1e5"
+"-localdt" = true
+"-noshow" = true
+
+# ---------------------------------------------------------------------------
+# Mesh refinement sweep — ideal solver baseline (5 cases)
+# ---------------------------------------------------------------------------
+[ideal]
+"-nelem" = [100, 200, 400, 800, 1600]
+
+# ---------------------------------------------------------------------------
+# Shot count sweep — nelem=200, varying shots (5 cases)
+# ---------------------------------------------------------------------------
+[shots_sweep]
+"-nelem" = 200
+"-shots" = [256, 512, 1024, 2048, 4096]
+
+# ---------------------------------------------------------------------------
+# Mesh x shots cross-product — fake backend (3 x 3 = 9 cases)
+# ---------------------------------------------------------------------------
+[fake_sweep]
+"-nelem" = [100, 200, 400]
+"-backend" = "fake fake_guadalupe"
+"-shots" = [256, 1024, 4096]
