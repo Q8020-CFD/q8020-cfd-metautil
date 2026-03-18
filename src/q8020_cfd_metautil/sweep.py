@@ -2077,29 +2077,32 @@ def run_sweep(
     # Use first group's script if no global script
     if script:
         script_path = Path(script)
-        script_dir = script_path.parent.resolve()
+        script_dir = script_path.parent.absolute()
     else:
         # Find first group with a _script to get script_dir
         for group_data in groups.values():
             group_script = group_data["params"].get("_script")
             if group_script:
-                script_dir = Path(group_script).parent.resolve()
+                script_dir = Path(group_script).parent.absolute()
                 break
         else:
-            script_dir = Path(".").resolve()
+            script_dir = Path(".").absolute()
     
     # Expand ~ to user home directory (works on Unix, Mac, Windows)
     output_dir_str = global_params.get("_output_dir", "./sweep_results")
-    output_dir = Path(output_dir_str).expanduser().resolve()
-    
+    # Use .absolute() instead of .resolve() so symlink paths (e.g.
+    # /ccs/home/... on OLCF Frontier) are preserved.  .resolve() follows
+    # symlinks to /autofs/... which may not be visible on compute nodes.
+    output_dir = Path(output_dir_str).expanduser().absolute()
+
     # Create date directory (yyyy-mm-dd) under output_dir
     date_str = datetime.now().strftime("%Y-%m-%d")
     date_dir = output_dir / date_str
-    
+
     # Create output_dir and date_dir if they don't exist
     if not dry_run:
         date_dir.mkdir(parents=True, exist_ok=True)
-    
+
     # Create run subdirectory with workflow ID under date dir
     if _run_dir_override is not None:
         workflow_id = _workflow_id_override or generate_workflow_id()
@@ -2184,7 +2187,7 @@ def run_sweep(
         env_path = group_params.get("_env")
         if env_path and group_executable:
             env_path_resolved = (
-                Path(env_path).expanduser().resolve()
+                Path(env_path).expanduser().absolute()
             )
             activate_cmd = (
                 f"source {env_path_resolved}/bin/activate"
@@ -2668,7 +2671,7 @@ def _run_multi_stage_sweep(
     # Shared workflow ID and base run directory for all stages
     workflow_id = generate_workflow_id()
     output_dir_str = outer_global.get("_output_dir", "./sweep_results")
-    output_dir = Path(output_dir_str).expanduser().resolve()
+    output_dir = Path(output_dir_str).expanduser().absolute()
     date_str = datetime.now().strftime("%Y-%m-%d")
     date_dir = output_dir / date_str
     base_run_dir = date_dir / workflow_id
