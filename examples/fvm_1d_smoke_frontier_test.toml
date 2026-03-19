@@ -12,7 +12,7 @@
 _slurm = true
 _run_mode = "parallel"
 _slurm_submit = true
-_slurm_project = "frontier_project"
+_slurm_project = "ard189"
 _slurm_partition = "batch"
 _slurm_walltime = "02:00:00"
 _cores_per_task = 1
