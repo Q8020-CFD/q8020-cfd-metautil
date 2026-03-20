@@ -16,7 +16,7 @@ _slurm_project = "ard189"
 _slurm_partition = "batch"
 _slurm_walltime = "02:00:00"
 _cores_per_task = 1
-_output_dir = "~/hhl_time_steps"
+_output_dir = "~/hhl_time_steps_with_trials"
 
 # Optional: broadcast packed conda env to NVMe burst buffer for fast imports
 # Create with: conda-pack -o packed_env.tar.gz
@@ -37,9 +37,12 @@ _inject_outdir = "-outdir"
 "-localdt" = true
 "-noshow" = true
 "-nelem" = 5
+"-iters" = 15
+"-initers" = 1
 
 # ---------------------------------------------------------------------------
 # Small test case for test validity
 # ---------------------------------------------------------------------------
-[time steps]
-"-cfl" = ["1e10", 1, 5, 10, 25]
+[time_steps]
+"-cfl" = [1, 5, 10, 25, 1e10]
+"_trials" = 10
