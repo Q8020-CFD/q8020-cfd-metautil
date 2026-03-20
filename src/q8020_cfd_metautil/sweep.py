@@ -1048,7 +1048,13 @@ def _build_case_launch_info(
     and the path to the serialized args file.
     """
     experiment_id = generate_experiment_id()
-    case_dir = run_dir / experiment_id
+    # Nest trial directories under their parent case directory
+    parent_case_id = params.get("_parent_case_id")
+    if parent_case_id:
+        trial_index = params.get("_trial_index", 0)
+        case_dir = run_dir / parent_case_id / f"trial_{trial_index}_{experiment_id}"
+    else:
+        case_dir = run_dir / experiment_id
     case_dir.mkdir(parents=True, exist_ok=True)
 
     # Build solver command (same logic as run_sweep sequential path)
@@ -1759,19 +1765,27 @@ def _finalize_slurm(
 def expand_case_lists(case_id: str, case_params: dict) -> list:
     """
     Expand a case with list-valued parameters into multiple subcases.
-    
+
     For example, if a case has:
         shots = [100, 1000, 10000]
         ancilla = 6
-    
+
     This will expand into 3 subcases:
         case_id_0: shots=100, ancilla=6
         case_id_1: shots=1000, ancilla=6
         case_id_2: shots=10000, ancilla=6
-    
+
+    If ``_trials`` is set (integer > 1), each expanded case is replicated
+    that many times.  Trial cases are nested under their parent case
+    directory via ``_parent_case_id`` and ``_trial_index`` metadata keys
+    (both underscore-prefixed so they are never passed to the solver).
+
     Returns:
         List of (expanded_case_id, expanded_params) tuples
     """
+    # Extract _trials before processing (meta-key, not a solver param)
+    trials = int(case_params.pop("_trials", 1))
+
     list_params = {}
     scalar_params = {}
 
@@ -1783,19 +1797,31 @@ def expand_case_lists(case_id: str, case_params: dict) -> list:
 
     # If no lists, return the original case
     if not list_params:
-        return [(case_id, case_params.copy())]
+        expanded_cases = [(case_id, case_params.copy())]
+    else:
+        # Generate all combinations of list values
+        param_names = list(list_params.keys())
+        param_values = [list_params[name] for name in param_names]
 
-    # Generate all combinations of list values
-    param_names = list(list_params.keys())
-    param_values = [list_params[name] for name in param_names]
+        expanded_cases = []
+        for i, combination in enumerate(product(*param_values)):
+            expanded_id = f"{case_id}_{i}"
+            expanded_params = scalar_params.copy()
+            for param_name, param_value in zip(param_names, combination):
+                expanded_params[param_name] = param_value
+            expanded_cases.append((expanded_id, expanded_params))
 
-    expanded_cases = []
-    for i, combination in enumerate(product(*param_values)):
-        expanded_id = f"{case_id}_{i}"
-        expanded_params = scalar_params.copy()
-        for param_name, param_value in zip(param_names, combination):
-            expanded_params[param_name] = param_value
-        expanded_cases.append((expanded_id, expanded_params))
+    # Replicate each case _trials times
+    if trials > 1:
+        replicated = []
+        for eid, eparams in expanded_cases:
+            for t in range(trials):
+                trial_id = f"{eid}_trial_{t}"
+                trial_params = eparams.copy()
+                trial_params["_trial_index"] = t
+                trial_params["_parent_case_id"] = eid
+                replicated.append((trial_id, trial_params))
+        expanded_cases = replicated
 
     return expanded_cases
 
@@ -2270,8 +2296,13 @@ def run_sweep(
             # Generate experiment_id for this case
             experiment_id = generate_experiment_id()
 
-            # Create case output directory
-            case_dir = run_dir / experiment_id
+            # Create case output directory (nest trials under parent)
+            parent_case_id = params.get("_parent_case_id")
+            if parent_case_id:
+                trial_index = params.get("_trial_index", 0)
+                case_dir = run_dir / parent_case_id / f"trial_{trial_index}_{experiment_id}"
+            else:
+                case_dir = run_dir / experiment_id
             if not dry_run:
                 case_dir.mkdir(parents=True, exist_ok=True)
             group_case_dirs.append(case_dir)
