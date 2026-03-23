@@ -1736,6 +1736,25 @@ def _finalize_slurm(
                 )
 
             return job_id
+        except subprocess.CalledProcessError as e:
+            sbatch_stderr = (e.stderr or "").strip()
+            print(
+                f"{RED}{BOLD}sbatch failed:{RESET} {e}",
+                file=sys.stderr,
+            )
+            if sbatch_stderr:
+                print(sbatch_stderr, file=sys.stderr)
+            # Write log file for post-mortem diagnosis
+            error_log = run_dir / "slurm_submit_error.log"
+            with open(error_log, "w", encoding="utf-8") as f:
+                f.write(f"sbatch failed with exit code {e.returncode}\n\n")
+                f.write(sbatch_stderr or "(no stderr captured)")
+            for eid in all_results:
+                all_results[eid]["status"] = "submit_error"
+                all_results[eid]["error"] = str(e)
+                if sbatch_stderr:
+                    all_results[eid]["sbatch_stderr"] = sbatch_stderr
+            return None
         except Exception as e:
             print(
                 f"{RED}{BOLD}sbatch failed:{RESET} {e}",
