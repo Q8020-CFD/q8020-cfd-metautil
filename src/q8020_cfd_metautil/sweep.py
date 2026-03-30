@@ -876,7 +876,7 @@ def run_case_pipeline(
                 stdout=fout,
                 stderr=ferr,
                 check=False,
-                timeout=3600,
+                timeout=case_params.get("_case_timeout"),
             )
         returncode = proc_result.returncode
         end_time = _get_iso_timestamp()
@@ -2456,7 +2456,7 @@ def run_sweep(
                 workflow_id=workflow_id,
                 case_id=case_id,
                 case_params=params,
-                timeout=3600,
+                timeout=params.get("_case_timeout"),
                 env_path=env_path,
             )
 
