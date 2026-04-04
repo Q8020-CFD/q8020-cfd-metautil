@@ -1062,6 +1062,12 @@ def _build_case_launch_info(
     inject_outdir = params.get("_inject_outdir")
     if inject_outdir:
         cmd_args.extend([inject_outdir, str(case_dir)])
+    inject_exp = params.get("_inject_experiment_id")
+    if inject_exp:
+        cmd_args.extend([inject_exp, experiment_id])
+    inject_wf = params.get("_inject_workflow_id")
+    if inject_wf:
+        cmd_args.extend([inject_wf, workflow_id])
 
     if ("&&" in group_executable
             or "||" in group_executable
@@ -1932,7 +1938,7 @@ def build_command_args(params: dict, arg_mapping: dict = None) -> list:
         List of command-line arguments
     """
     args = []
-    skip_keys = {"executable", "_output_dir", "_case_preproc", "_case_postproc", "_group_postproc", "_final_postproc", "_inject_outdir", "_env"}
+    skip_keys = {"executable", "_output_dir", "_case_preproc", "_case_postproc", "_group_postproc", "_final_postproc", "_inject_outdir", "_inject_experiment_id", "_inject_workflow_id", "_env"}
     
     for key, value in params.items():
         if key in skip_keys or key.startswith("_"):
@@ -2330,10 +2336,16 @@ def run_sweep(
             # Build command args
             cmd_args = build_command_args(params, arg_mapping)
 
-            # Inject outdir arg if _inject_outdir is set
+            # Inject outdir/experiment/workflow args
             inject_outdir = params.get("_inject_outdir")
             if inject_outdir:
                 cmd_args.extend([inject_outdir, str(case_dir)])
+            inject_exp = params.get("_inject_experiment_id")
+            if inject_exp:
+                cmd_args.extend([inject_exp, experiment_id])
+            inject_wf = params.get("_inject_workflow_id")
+            if inject_wf:
+                cmd_args.extend([inject_wf, workflow_id])
 
             # Check if _script contains shell operators
             if ("&&" in group_executable

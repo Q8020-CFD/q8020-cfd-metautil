@@ -134,6 +134,153 @@ and records overhead timing separately from solver time.
 
 ```bash
 q8020-sweep sweep_config.toml
+q8020-sweep sweep_config.toml --dry-run
+q8020-sweep sweep_config.toml --groups ideal shots
+q8020-sweep sweep_config.toml --set _output_dir=/tmp/test
+```
+
+### TOML format
+
+A sweep config has a `[global]` section and one or more **group**
+sections.  Each group becomes one or more cases.  Global parameters are
+inherited by all groups; group-level keys override globals.
+
+```toml
+[global]
+_output_dir = "~/q8020"
+_script = "source .venv/bin/activate && python solver.py"
+_inject_outdir = "-outdir"
+"-nelem" = 5
+"-time_scheme" = "BDF1"
+
+[ideal]
+# inherits all global params, no overrides
+
+[shots]
+"-shots" = 1024
+```
+
+Parameters whose keys start with `-` are passed as CLI args to the
+solver (e.g. `"-nelem" = 5` becomes `-nelem 5`).  Parameters whose
+keys start with `_` are sweeper directives and are never passed to the
+solver.
+
+#### List expansion
+
+Any parameter with a list value is expanded into a cross-product of
+cases:
+
+```toml
+[sweep]
+"-cfl" = [1, 5, 10, 25]
+"-shots" = [1024, 8192]
+```
+
+This produces 8 cases (4 CFL values x 2 shot counts).
+
+#### Sweeper directives (`_` keys)
+
+**Execution:**
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `_script` | string | -- | Shell command to run.  May include `&&`, pipes, etc. |
+| `_env` | string | -- | Path to venv; snapshotted before/after each case |
+| `_output_dir` | string | `./sweep_results` | Root output directory |
+| `_run_mode` | string | `sequential` | `sequential` or `parallel` |
+| `_case_timeout` | int/null | none | Per-case timeout in seconds |
+| `_trials` | int | 1 | Replicate each case N times (nested dirs) |
+
+**Injection (passing sweep context to the solver):**
+
+| Key | Type | Description |
+|---|---|---|
+| `_inject_outdir` | string | CLI flag name for case output directory |
+| `_inject_experiment_id` | string | CLI flag name for the experiment ID |
+| `_inject_workflow_id` | string | CLI flag name for the workflow ID |
+
+For example, with:
+
+```toml
+_inject_outdir = "-outdir"
+_inject_experiment_id = "-exp"
+_inject_workflow_id = "-wf"
+```
+
+The sweeper appends `-outdir /path/to/case_dir -exp a1b2c3d4 -wf
+_f8e9a0b1` to the solver command.
+
+**Hooks (pre/post-processing):**
+
+| Key | Type | Description |
+|---|---|---|
+| `_case_preproc` | list[str] | Commands run before each case |
+| `_case_postproc` | list[str] | Commands run after each case |
+| `_group_postproc` | list[str] | Commands run after all cases in a group |
+| `_final_postproc` | list[str] | Commands run after the entire sweep |
+
+**SLURM:**
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `_slurm` | bool | false | Enable SLURM sbatch generation |
+| `_slurm_submit` | bool | false | Auto-submit the sbatch script |
+| `_slurm_interactive` | bool | false | Use srun inside an active salloc |
+| `_slurm_project` | string | -- | SLURM account/project ID |
+| `_slurm_partition` | string | `batch` | SLURM partition |
+| `_slurm_walltime` | string | `00:30:00` | Walltime limit |
+| `_slurm_poll_wait` | float | 5 | Seconds to poll sacct after submit |
+| `_cores_per_task` | int | 1 | CPUs per srun task |
+
+#### Multi-stage sweeps
+
+For pipelines where one stage feeds into the next, use `[stage.*]`
+sections instead of top-level groups:
+
+```toml
+[global]
+_output_dir = "~/q8020"
+_slurm = true
+_slurm_submit = true
+
+[stage.solve]
+_script = "python solver.py"
+[stage.solve.case_a]
+"-nelem" = 5
+
+[stage.postprocess]
+_script = "python analyze.py --input {{stages.solve.run_dir}}"
+[stage.postprocess.case_a]
+"-format" = "pdf"
+```
+
+Each stage runs sequentially.  SLURM stages are chained with
+`--dependency=afterok:<job_id>`.  The `{{stages.<name>.<prop>}}`
+syntax substitutes values from completed stages (`run_dir`,
+`slurm_job_id`).
+
+### Output structure
+
+```
+<_output_dir>/<date>/<_workflow_id>/
+    q8020_sweep_meta<wf_id>.json    # overall sweep metadata
+    q8020_expanded_cases.json       # all parameter combinations
+    q8020_<config>.toml             # copy of input TOML
+    <experiment_id>/                # one per case
+        q8020_params_<exp_id>.json
+        q8020_stdout_<exp_id>.txt
+        q8020_stderr_<exp_id>.txt
+        q8020_metadata_<exp_id>.json
+        ...solver artifacts...
+```
+
+When `_trials > 1`, trial directories are nested:
+
+```
+<experiment_id>/
+    trial_0_<trial_exp_id>/
+    trial_1_<trial_exp_id>/
+    ...
 ```
 
 ## Analysis tools
