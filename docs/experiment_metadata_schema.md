@@ -28,19 +28,30 @@ For quantum backends, the discernable data about the machine may differ by vendo
 
 ## Tooling
 
-This repo contains some reusable tools and all should at the moment be considered "works in progress", provided as-is. 
+This repo contains reusable tools, provided as-is.
 
-- args.py: boilerplate arguments for common quantum codes (e.g. backend, shots)
+- **args.py**: Boilerplate argparse groups for common quantum codes
+  (e.g. backend, shots).
 
-- meta_fragment.py: takes objects and produces metadata json, fragments being different aspects of the metadata set (e.g. metadata fragment about the run environment / backend)
+- **meta_fragment.py**: Takes live objects (backends, circuits, etc.)
+  and produces metadata JSON fragments.
 
-- harvest.py: rolls up fragments for an experiment (i.e. specific {case, code, backend}). Note that some fragments could potentially appear multiple times in the same experiment. 
+- **harvest.py** (`q8020-harvest`): Rolls up fragments for an
+  experiment (i.e. specific {case, code, backend}). Fragments may
+  appear multiple times in the same experiment.
 
-- compare.py: what it implies, work-in-progress
+- **metakeys.py** (`q8020-metakeys`): Find metadata keys in an
+  experiment or common across experiments; flatten the name tree or be
+  verbose. Necessary for search and comparison.
 
-- metakeys.py: find the metadata in an experiment or common across experiments, flatten the name tree or be verbose; necessary for search and comparison, work-in-progress
-
-- sweep.py: take a TOML describing the experiment and run it, "sweeping" parameters where specified in the TOML. Permits pre- and post-processing, use of venvs, subdir per experiment, etc. Current work-in-progress is to extend this to leverage HPC (i.e. slurm interface) for (embarrassing at least) parallelism. 
+- **sweep.py** (`q8020-sweep`): Takes a TOML config describing the
+  experiment and runs it, sweeping parameters where specified.
+  Supports sequential and parallel execution, SLURM sbatch/srun
+  submission, per-case timeouts, trial replication, multi-stage
+  pipelines with job chaining, and injection of sweep context
+  (output directory, experiment ID, workflow ID) into solver
+  commands. See [README.md](../README.md#sweeper) for the full TOML
+  format reference.
 
 
 ## Repos
@@ -277,7 +288,7 @@ Each entry in `cases` contains sweeper-observed execution data:
 | Field | Type | Description |
 |-------|------|-------------|
 | command | array | Full command executed |
-| status | string | success, error, timeout, exception |
+| status | string | success, error, timeout, exception, submitted, generated, dry_run, slurm_completed, slurm_failed, submit_error |
 | returncode | int | Process exit code |
 | start_time | string | ISO 8601 case start |
 | end_time | string | ISO 8601 case end |
@@ -292,3 +303,7 @@ The sweeper metadata and per-case `q8020_metadata_<experiment_id>.json` are comp
 - **Case metadata**: Internal view—algorithm parameters, results, analysis
 
 The `experiment_id` links records across both files. The sweeper also copies the input TOML and writes `q8020_expanded_cases.json` showing the full parameter expansion before execution.
+
+For the sweeper TOML configuration format (directives, injection keys,
+SLURM options, multi-stage pipelines), see
+[README.md > Sweeper](../README.md#sweeper).

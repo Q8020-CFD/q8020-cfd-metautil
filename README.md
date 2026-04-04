@@ -26,6 +26,11 @@ stays open to algorithm- and backend-specific data.
 Flattened keys follow the pattern `section.index.field`, e.g.
 `backend.0.name`, `results.0.fidelity`.
 
+For the full field-by-field schema specification, see
+[docs/experiment_metadata_schema.md](docs/experiment_metadata_schema.md).
+For LLM-based metadata review instructions, see
+[docs/llm-metadata-review.md](docs/llm-metadata-review.md).
+
 ## Two instrumentation models
 
 ### Open box -- direct instrumentation
