@@ -144,6 +144,12 @@ q8020-sweep sweep_config.toml --groups ideal shots
 q8020-sweep sweep_config.toml --set _output_dir=/tmp/test
 ```
 
+`--set KEY=VALUE` overrides any `[global]` key before the sweep
+runs.  Repeatable (`--set _output_dir=/tmp --set _slurm=false`).
+Values are coerced to bool/int/float where possible, otherwise kept
+as strings.  Combined with `${VAR}` templates, `--set` lets you
+parameterize a TOML without editing it.
+
 ### TOML format
 
 A sweep config has a `[global]` section and one or more **group**
@@ -183,6 +189,31 @@ cases:
 
 This produces 8 cases (4 CFL values x 2 shot counts).
 
+#### Template variables (`${VAR}`)
+
+Any string value in the TOML may contain `${VAR}` tokens.  After
+`--set` overrides are applied, the sweeper resolves these from
+`[global]` params.  This works anywhere — in `_script`, solver
+args, postproc commands, group-level overrides, etc.
+
+```toml
+[global]
+_output_dir = "~/q8020"
+_solver_dir = "./fvm_euler_1d_solver/.venv"
+_script = """\
+source ${_solver_dir}/bin/activate && \
+python solver.py\
+"""
+```
+
+Override at the CLI:
+
+```bash
+q8020-sweep config.toml --set _solver_dir=/opt/venvs/solver
+```
+
+Unresolved tokens (no matching global key) are left as-is.
+
 #### Sweeper directives (`_` keys)
 
 **Execution:**
@@ -190,7 +221,7 @@ This produces 8 cases (4 CFL values x 2 shot counts).
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `_script` | string | -- | Shell command to run.  May include `&&`, pipes, etc. |
-| `_env` | string | -- | Path to venv; snapshotted before/after each case |
+| `_env` | string | -- | Path to venv; auto-activated before the solver command and snapshotted before/after each case |
 | `_output_dir` | string | `./sweep_results` | Root output directory |
 | `_run_mode` | string | `sequential` | `sequential` or `parallel` |
 | `_case_timeout` | int/null | none | Per-case timeout in seconds |
@@ -219,23 +250,63 @@ _f8e9a0b1` to the solver command.
 
 | Key | Type | Description |
 |---|---|---|
-| `_case_preproc` | list[str] | Commands run before each case |
-| `_case_postproc` | list[str] | Commands run after each case |
-| `_group_postproc` | list[str] | Commands run after all cases in a group |
-| `_final_postproc` | list[str] | Commands run after the entire sweep |
+| `_case_preproc` | str or list[str] | Commands run before each case |
+| `_case_postproc` | str or list[str] | Commands run after each case |
+| `_group_postproc` | str or list[str] | Commands run after all cases in a group |
+| `_final_postproc` | str or list[str] | Commands run after the entire sweep |
+
+Hook commands run in the **sweeper's own environment**, not the
+solver's `_env` venv.  The sweeper adds `script_dir` to `PYTHONPATH`
+but does not activate any venv for hooks.  If a hook needs packages
+from a specific venv, use a multi-line command with `&&` to activate
+it:
+
+```toml
+_case_postproc = [
+    "source ./analysis/.venv/bin/activate && python harvester.py"
+]
+```
+
+Commands containing shell operators (`&&`, `||`, `|`, `` ` ``,
+`$(...)`) are automatically wrapped in `bash -c`.  Each hook command
+receives a JSON context file as its last argument, containing the
+`case_id`, `experiment_id`, `workflow_id`, `case_dir`, and `params`.
 
 **SLURM:**
+
+When `_slurm = true`, the sweeper generates an sbatch script and submits
+it automatically.  Use `--dry-run` to generate the script without
+submitting.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `_slurm` | bool | false | Enable SLURM sbatch generation |
-| `_slurm_submit` | bool | false | Auto-submit the sbatch script |
 | `_slurm_interactive` | bool | false | Use srun inside an active salloc |
 | `_slurm_project` | string | -- | SLURM account/project ID |
 | `_slurm_partition` | string | `batch` | SLURM partition |
 | `_slurm_walltime` | string | `00:30:00` | Walltime limit |
 | `_slurm_poll_wait` | float | 5 | Seconds to poll sacct after submit |
-| `_cores_per_task` | int | 1 | CPUs per srun task |
+| `_slurm_cores_per_task` | int | 1 | CPUs per srun task |
+| `_slurm_exclusive_node` | bool | false | Pin each case to its own node |
+| `_slurm_cores_per_node` | int | 64 | Cores per node (packed mode only) |
+| `_slurm_pack_venvs` | list | [] | Venv paths to auto-tar and broadcast to NVMe |
+
+**Node allocation:**  By default the sweeper packs multiple cases per
+node (`tasks_per_node = cores_per_node // cores_per_task`).  Set
+`_slurm_exclusive_node = true` to request one node per case instead.
+When exclusive mode is on, `_slurm_cores_per_task` and
+`_slurm_cores_per_node` are ignored.
+
+**NVMe venv broadcast:**  For large-scale runs, set `_slurm_pack_venvs`
+to a list of venv directories.  Before submission the sweeper tars each
+venv (with a freshness check against `lib/` mtime), and the sbatch
+script broadcasts the archives to each node's NVMe burst buffer via
+`sbcast`.  The solver and postproc commands are automatically rewritten
+to activate from NVMe instead of the shared filesystem.
+
+```toml
+_slurm_pack_venvs = ["./fvm_euler_1d_solver/.venv", "./.venv"]
+```
 
 #### Multi-stage sweeps
 
@@ -246,7 +317,6 @@ sections instead of top-level groups:
 [global]
 _output_dir = "~/q8020"
 _slurm = true
-_slurm_submit = true
 
 [stage.solve]
 _script = "python solver.py"

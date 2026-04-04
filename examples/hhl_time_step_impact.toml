@@ -11,11 +11,10 @@
 [global]
 _slurm = true
 _run_mode = "parallel"
-_slurm_submit = true
 _slurm_project = "ard189"
 _slurm_partition = "batch"
 _slurm_walltime = "02:00:00"
-_cores_per_task = 1
+_slurm_cores_per_task = 1
 _output_dir = "~/hhl_time_steps_with_trials"
 
 # Optional: broadcast packed conda env to NVMe burst buffer for fast imports

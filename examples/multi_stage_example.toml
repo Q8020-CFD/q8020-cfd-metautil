@@ -52,7 +52,6 @@ _inject_outdir = "-outdir"
 # _slurm = true
 # _slurm_project = "CFD154"
 # _slurm_walltime = "02:00:00"
-# _slurm_submit = true
 # _inject_outdir = "-outdir"
 # "-mesh_dir" = "{{stages.mesh.run_dir}}"
 # "-linsolver" = "HHL"

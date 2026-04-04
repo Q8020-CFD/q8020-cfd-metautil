@@ -1,16 +1,44 @@
-# FVM Euler 1D Solver - example invocation via q8020-sweeper 
+# FVM Euler 1D Solver - smoke test
+#
+# Local (sequential):
+#   q8020-sweep fvm_1d_smoke_test.toml
+#   q8020-sweep fvm_1d_smoke_test.toml --dry-run
+#
+# Frontier (parallel SLURM):
+#   q8020-sweep fvm_1d_smoke_test.toml \
+#     --set _slurm=true \
+#     --set _output_dir=/lustre/orion/ard189/q8020
 
 [global]
 _output_dir = "~/q8020"
-_env = "./fvm_euler_1d_solver/.venv"
+
+# --- Paths (override with --set for different layouts) ---
+_solver_dir = "./fvm_euler_1d_solver"
+_metautil_dir = "./q8020-cfd-metautil"
+_experiment_dir = "./q8020-cfd-experiments"
+_postproc_venv = "./.venv"
+
+# --- SLURM (off by default; enable with --set _slurm=true) ---
+_slurm = false
+_run_mode = "parallel" # "sequential" for local runs, but parallel works there too
+_slurm_project = "ard189"
+_slurm_partition = "batch"
+_slurm_walltime = "02:00:00"
+_slurm_exclusive_node = true  # each case gets own node
+_slurm_pack_venvs = ["${_solver_dir}/.venv", "${_postproc_venv}"]  # NVMe burst buffer
+
+# --- Solver command ---
 _script = """\
-source ./fvm_euler_1d_solver/.venv/bin/activate && \
-python ./fvm_euler_1d_solver/nozzle_1d_solver.py\
+source ${_solver_dir}/.venv/bin/activate && \
+python3 ${_solver_dir}/nozzle_1d_solver.py\
 """
-_case_postproc = [
-    "python -m q8020_cfd_metautil.harvesters.fvm_euler_1d_solver_harvester"
-]
+_case_postproc = """\
+source ${_postproc_venv}/bin/activate && \
+python3 ${_experiment_dir}/codes/fvm_euler_1d_nozzle/fvm_euler_1d_solver_harvester.py\
+"""
 _inject_outdir = "-outdir"
+
+# --- Solver parameters ---
 "-nelem" = 2
 "-time_scheme" = "BDF1"
 "-linsolver" = "HHL"
@@ -20,13 +48,9 @@ _inject_outdir = "-outdir"
 [ideal]
 
 [shots]
-"-shots" = 1024 
+"-shots" = 1024
 
-[fake_real]
-"-backend" = "fake fake_guadalupe"
-"-shots" = 1024 
-
-
-
+[bigshots]
+"-shots" = [ 1000, 10000, 100000, 150000 ] 
 
 

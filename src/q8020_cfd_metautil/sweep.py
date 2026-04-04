@@ -54,9 +54,11 @@ Usage:
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import time
 
 import subprocess_tee
@@ -105,6 +107,60 @@ def _derive_experiment_name(command: list[str]) -> str:
         script_path = Path(command[1])
         return script_path.stem
     return "unknown"
+
+
+_TEMPLATE_RE = re.compile(r"\$\{([^}]+)\}")
+
+
+def _expand_templates(
+    obj: Any,
+    variables: dict[str, Any],
+) -> Any:
+    """Recursively replace ${VAR} tokens in string values.
+
+    ``variables`` is typically the resolved [global] params (after
+    --set overrides).  Non-string values and keys are left untouched.
+    """
+    if isinstance(obj, str):
+        def _replace(m: re.Match) -> str:
+            key = m.group(1)
+            val = variables.get(key)
+            if val is None:
+                return m.group(0)  # leave unresolved
+            return str(val)
+        return _TEMPLATE_RE.sub(_replace, obj)
+    if isinstance(obj, dict):
+        return {
+            k: _expand_templates(v, variables)
+            for k, v in obj.items()
+        }
+    if isinstance(obj, list):
+        return [_expand_templates(v, variables) for v in obj]
+    return obj
+
+
+def _extract_script_dir(script_cmd: str | None) -> Path | None:
+    """Extract the script's parent dir from a (possibly compound) command.
+
+    Handles commands like:
+        "python solver.py"
+        "source .venv/bin/activate && python3 ./dir/solver.py"
+    Returns the absolute parent directory of the .py file, or None.
+    """
+    if not script_cmd:
+        return None
+    # Find the last python/python3 invocation and grab the next token
+    tokens = script_cmd.replace("\\", " ").split()
+    for i in range(len(tokens) - 1, -1, -1):
+        base = os.path.basename(tokens[i])
+        if base in ("python", "python3") and i + 1 < len(tokens):
+            candidate = tokens[i + 1]
+            if not candidate.startswith("-"):
+                return Path(candidate).parent.absolute()
+    # Fallback: if the whole thing looks like a simple path
+    if not any(c in script_cmd for c in ("&&", "|", ";")):
+        return Path(script_cmd.strip()).parent.absolute()
+    return None
 
 
 def _is_venv(path: Path) -> bool:
@@ -1149,7 +1205,7 @@ def _finalize_slurm_interactive(
                 "-p batch' first, then re-run q8020-sweep."
             )
 
-    cores = int(global_params.get("_cores_per_task", 1))
+    cores = int(global_params.get("_slurm_cores_per_task", 1))
     poll_interval = float(global_params.get("_poll_interval", 2))
 
     if dry_run:
@@ -1410,17 +1466,80 @@ def _finalize_local_parallel(
             time.sleep(poll_interval)
 
 
+def _pack_venvs(
+    venv_paths: list[str],
+    run_dir: Path,
+    dry_run: bool = False,
+) -> dict[str, Path]:
+    """Tar each venv for NVMe broadcast.
+
+    Returns mapping of resolved venv path -> tarball Path.
+    Skips rebuild if tarball is newer than venv's lib/ directory.
+    """
+    packed: dict[str, Path] = {}
+    for raw_path in venv_paths:
+        venv_dir = Path(raw_path).expanduser().resolve()
+        if not venv_dir.is_dir():
+            print(
+                f"{YELLOW}Warning: venv not found,"
+                f" skipping pack: {venv_dir}{RESET}",
+                file=sys.stderr,
+            )
+            continue
+
+        # Use venv directory name as tarball stem
+        safe_name = str(venv_dir).replace("/", "_").strip("_")
+        tarball = run_dir / f"{safe_name}.tar.gz"
+
+        # Freshness: skip if tarball exists and is newer than
+        # the venv lib/ dir (proxy for pip install changes)
+        lib_dir = venv_dir / "lib"
+        if (
+            tarball.exists()
+            and lib_dir.exists()
+            and tarball.stat().st_mtime
+            > lib_dir.stat().st_mtime
+        ):
+            print(
+                f"  {DIM}Pack up-to-date:{RESET} {tarball}"
+            )
+            packed[str(venv_dir)] = tarball
+            continue
+
+        if dry_run:
+            print(
+                f"  {DIM}Would pack:{RESET}"
+                f" {venv_dir} -> {tarball}"
+            )
+            packed[str(venv_dir)] = tarball
+            continue
+
+        print(
+            f"  Packing {venv_dir} ...", end="", flush=True
+        )
+        with tarfile.open(tarball, "w:gz") as tar:
+            tar.add(str(venv_dir), arcname=".")
+        size_mb = tarball.stat().st_size / (1024 * 1024)
+        print(f" {size_mb:.1f} MB")
+        packed[str(venv_dir)] = tarball
+
+    return packed
+
+
 def _generate_sbatch_script(
     cases_info: list[dict[str, Any]],
     global_params: dict[str, Any],
     run_dir: Path,
     dependency_job_id: str | None = None,
+    packed_venvs: dict[str, Path] | None = None,
 ) -> str:
     """Generate a single sbatch script that runs all cases in parallel.
 
     Args:
         dependency_job_id: If provided, adds ``#SBATCH --dependency=afterok:<id>``
             so this job waits for the specified job to complete successfully.
+        packed_venvs: Mapping of resolved venv path -> tarball Path,
+            from ``_pack_venvs``.
 
     Returns the sbatch script content as a string.
     """
@@ -1428,17 +1547,29 @@ def _generate_sbatch_script(
     walltime = global_params.get("_slurm_walltime", "02:00:00")
     partition = global_params.get("_slurm_partition", "batch")
     conda_archive = global_params.get("_slurm_conda_archive", "")
-    cores = int(global_params.get("_cores_per_task", 1))
+    cores = int(global_params.get("_slurm_cores_per_task", 1))
+    exclusive_node = bool(
+        global_params.get("_slurm_exclusive_node", False)
+    )
 
     n_cases = len(cases_info)
-    # Frontier: 64 cores per node
-    cores_per_node = 64
-    n_nodes = max(1, -(-n_cases // cores_per_node))  # ceiling div
+    cores_per_node = int(
+        global_params.get("_slurm_cores_per_node", 64)
+    )
+    if exclusive_node:
+        n_nodes = n_cases  # 1 node per case
+    else:
+        tasks_per_node = max(1, cores_per_node // cores)
+        n_nodes = max(1, -(-n_cases // tasks_per_node))
 
     # Collect worker commands
     srun_lines = []
     for info in cases_info:
         worker = (
+            f"srun -N 1 -n 1 -c {cores} --exclusive "
+            f"python3 -m q8020_cfd_metautil.sweep_worker "
+            f"{info['args_file']} &"
+        ) if exclusive_node else (
             f"srun -n 1 -c {cores} --exclusive "
             f"python3 -m q8020_cfd_metautil.sweep_worker "
             f"{info['args_file']} &"
@@ -1447,9 +1578,63 @@ def _generate_sbatch_script(
 
     srun_block = "\n".join(srun_lines)
 
-    # Conda setup section (only if archive provided)
-    if conda_archive:
-        conda_section = f"""\
+    # Environment broadcast section
+    env_section = ""
+    nvme_venv_map: dict[str, str] = {}  # original path -> NVMe path
+
+    if packed_venvs:
+        lines = [
+            "# --- Broadcast packed venvs to NVMe ---",
+        ]
+        for i, (orig_path, tarball) in enumerate(
+            packed_venvs.items()
+        ):
+            env_name = f"venv_{i}"
+            nvme_path = f"/mnt/bb/${{USER}}/{env_name}"
+            nvme_venv_map[orig_path] = nvme_path
+            lines.append(f"echo 'Broadcasting {tarball.name}...'")
+            lines.append(
+                f"sbcast -pf {tarball}"
+                f" /mnt/bb/${{USER}}/{env_name}.tar.gz"
+            )
+            lines.append(
+                f'if [ "$?" != "0" ]; then'
+                f' echo "ERROR: sbcast {tarball.name} failed";'
+                f" exit 1; fi"
+            )
+            lines.append(
+                f"srun -N ${{SLURM_NNODES}}"
+                f" --ntasks-per-node 1"
+                f" mkdir -p {nvme_path}"
+            )
+            lines.append(
+                f"srun -N ${{SLURM_NNODES}}"
+                f" --ntasks-per-node 1"
+                f" tar -xzf /mnt/bb/${{USER}}/{env_name}.tar.gz"
+                f" -C {nvme_path}"
+            )
+            # Fix VIRTUAL_ENV in activate script
+            lines.append(
+                f'srun -N ${{SLURM_NNODES}}'
+                f' --ntasks-per-node 1'
+                f' sed -i'
+                f' "s|VIRTUAL_ENV=.*|VIRTUAL_ENV=\\"{nvme_path}\\"|"'
+                f' {nvme_path}/bin/activate'
+            )
+        lines.append('echo "Environments ready"')
+        lines.append("")
+        env_section = "\n".join(lines)
+
+        # Rewrite srun commands to use NVMe venv paths
+        rewritten = []
+        for srun_line in srun_lines:
+            for orig, nvme in nvme_venv_map.items():
+                srun_line = srun_line.replace(orig, nvme)
+            rewritten.append(srun_line)
+        srun_lines = rewritten
+        srun_block = "\n".join(srun_lines)
+    elif conda_archive:
+        env_section = f"""\
 # --- SBCAST conda environment to NVMe ---
 ENV_ARCHIVE={conda_archive}
 ENV_NAME=sweep_conda_env
@@ -1464,20 +1649,14 @@ fi
 
 srun -N ${{SLURM_NNODES}} --ntasks-per-node 1 \\
     mkdir -p $NVME_ENV_PATH
-srun -N ${{SLURM_NNODES}} --ntasks-per-node 1 -c56 \\
-    tar --use-compress-program=pigz \\
-    -xf /mnt/bb/${{USER}}/${{ENV_NAME}}.tar.gz \\
+srun -N ${{SLURM_NNODES}} --ntasks-per-node 1 \\
+    tar -xzf /mnt/bb/${{USER}}/${{ENV_NAME}}.tar.gz \\
     -C $NVME_ENV_PATH
 
 source ${{NVME_ENV_PATH}}/bin/activate
-srun -N ${{SLURM_NNODES}} --ntasks-per-node 1 conda-unpack
 
 echo "Environment ready"
 echo ""
-"""
-    else:
-        conda_section = """\
-# No _slurm_conda_archive specified -- using default environment
 """
 
     dependency_line = ""
@@ -1507,7 +1686,7 @@ export OPENBLAS_NUM_THREADS=1
 
 cd $SLURM_SUBMIT_DIR || exit 1
 
-{conda_section}
+{env_section}
 # --- Launch all cases in parallel ---
 echo "Launching {n_cases} cases..."
 START_TIME=$(date +%s)
@@ -1693,9 +1872,75 @@ def _finalize_slurm(
     Returns:
         The SLURM job ID if successfully submitted, otherwise ``None``.
     """
+    # Auto-pack venvs for NVMe broadcast if requested
+    packed_venvs = None
+    pack_venvs_list = global_params.get("_slurm_pack_venvs", [])
+    if isinstance(pack_venvs_list, str):
+        pack_venvs_list = [pack_venvs_list]
+    if pack_venvs_list:
+        run_dir.mkdir(parents=True, exist_ok=True)
+        packed_venvs = _pack_venvs(
+            pack_venvs_list, run_dir, dry_run,
+        )
+
+        # Build mapping of venv path -> NVMe path.
+        # Include both raw (as in template-expanded cmd) and
+        # resolved forms so string replacement catches both.
+        user = os.environ.get("USER", "unknown")
+        nvme_map: dict[str, str] = {}
+        for i, raw_path in enumerate(pack_venvs_list):
+            nvme = f"/mnt/bb/{user}/venv_{i}"
+            resolved = str(
+                Path(raw_path).expanduser().resolve()
+            )
+            nvme_map[resolved] = nvme
+            # Also map the raw form (e.g. "./fvm_euler_1d_solver/.venv")
+            if raw_path != resolved:
+                nvme_map[raw_path] = nvme
+
+        # Sort longest-first to avoid partial matches
+        # (e.g. "./.venv" inside "./solver/.venv")
+        nvme_replacements = sorted(
+            nvme_map.items(), key=lambda kv: len(kv[0]),
+            reverse=True,
+        )
+
+        # Rewrite cmd and postproc in each pipeline_args.json
+        for info in all_cases_info:
+            args_file = Path(info["args_file"])
+            if not args_file.exists():
+                continue
+            with open(args_file, encoding="utf-8") as f:
+                pargs = json.load(f)
+            changed = False
+            # Rewrite cmd list entries
+            new_cmd = []
+            for part in pargs.get("cmd", []):
+                for orig, nvme in nvme_replacements:
+                    part = part.replace(orig, nvme)
+                new_cmd.append(part)
+            if new_cmd != pargs.get("cmd"):
+                pargs["cmd"] = new_cmd
+                changed = True
+            # Rewrite case_postproc entries
+            new_pp = []
+            for pp in pargs.get("case_postproc", []):
+                for orig, nvme in nvme_replacements:
+                    pp = pp.replace(orig, nvme)
+                new_pp.append(pp)
+            if new_pp != pargs.get("case_postproc"):
+                pargs["case_postproc"] = new_pp
+                changed = True
+            if changed:
+                with open(
+                    args_file, "w", encoding="utf-8"
+                ) as f:
+                    json.dump(pargs, f, indent=2)
+
     sbatch_content = _generate_sbatch_script(
         all_cases_info, global_params, run_dir,
         dependency_job_id=dependency_job_id,
+        packed_venvs=packed_venvs,
     )
     sbatch_file = run_dir / "q8020_sweep.sbatch"
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -1714,72 +1959,59 @@ def _finalize_slurm(
             all_results[eid]["status"] = "dry_run"
         return None
 
-    slurm_submit = global_params.get("_slurm_submit", False)
-    if slurm_submit:
-        try:
-            sub = subprocess.run(
-                ["sbatch", str(sbatch_file)],
-                capture_output=True, text=True,
-                check=True,
-            )
-            job_line = sub.stdout.strip()
-            print(
-                f"{GREEN}{BOLD}Submitted:{RESET} {job_line}"
-            )
-            job_id = _parse_slurm_job_id(job_line)
-            for eid in all_results:
-                all_results[eid]["status"] = "submitted"
-                all_results[eid]["slurm_output"] = job_line
-
-            # Brief poll to catch jobs that fail instantly
-            if job_id:
-                poll_wait = float(
-                    global_params.get("_slurm_poll_wait", 5)
-                )
-                _poll_slurm_job(
-                    job_id, all_results, run_dir,
-                    poll_wait,
-                )
-
-            return job_id
-        except subprocess.CalledProcessError as e:
-            sbatch_stderr = (e.stderr or "").strip()
-            print(
-                f"{RED}{BOLD}sbatch failed:{RESET} {e}",
-                file=sys.stderr,
-            )
-            if sbatch_stderr:
-                print(sbatch_stderr, file=sys.stderr)
-            # Write log file for post-mortem diagnosis
-            error_log = run_dir / "slurm_submit_error.log"
-            with open(error_log, "w", encoding="utf-8") as f:
-                f.write(f"sbatch failed with exit code {e.returncode}\n\n")
-                f.write(sbatch_stderr or "(no stderr captured)")
-            for eid in all_results:
-                all_results[eid]["status"] = "submit_error"
-                all_results[eid]["error"] = str(e)
-                if sbatch_stderr:
-                    all_results[eid]["sbatch_stderr"] = sbatch_stderr
-            return None
-        except Exception as e:
-            print(
-                f"{RED}{BOLD}sbatch failed:{RESET} {e}",
-                file=sys.stderr,
-            )
-            for eid in all_results:
-                all_results[eid]["status"] = "submit_error"
-                all_results[eid]["error"] = str(e)
-            return None
-    else:
-        if dependency_job_id:
-            print(
-                f"\n  {DIM}(depends on job {dependency_job_id}){RESET}"
-            )
+    try:
+        sub = subprocess.run(
+            ["sbatch", str(sbatch_file)],
+            capture_output=True, text=True,
+            check=True,
+        )
+        job_line = sub.stdout.strip()
         print(
-            f"\nTo submit: {BOLD}sbatch {sbatch_file}{RESET}"
+            f"{GREEN}{BOLD}Submitted:{RESET} {job_line}"
+        )
+        job_id = _parse_slurm_job_id(job_line)
+        for eid in all_results:
+            all_results[eid]["status"] = "submitted"
+            all_results[eid]["slurm_output"] = job_line
+
+        # Brief poll to catch jobs that fail instantly
+        if job_id:
+            poll_wait = float(
+                global_params.get("_slurm_poll_wait", 5)
+            )
+            _poll_slurm_job(
+                job_id, all_results, run_dir,
+                poll_wait,
+            )
+
+        return job_id
+    except subprocess.CalledProcessError as e:
+        sbatch_stderr = (e.stderr or "").strip()
+        print(
+            f"{RED}{BOLD}sbatch failed:{RESET} {e}",
+            file=sys.stderr,
+        )
+        if sbatch_stderr:
+            print(sbatch_stderr, file=sys.stderr)
+        # Write log file for post-mortem diagnosis
+        error_log = run_dir / "slurm_submit_error.log"
+        with open(error_log, "w", encoding="utf-8") as f:
+            f.write(f"sbatch failed with exit code {e.returncode}\n\n")
+            f.write(sbatch_stderr or "(no stderr captured)")
+        for eid in all_results:
+            all_results[eid]["status"] = "submit_error"
+            all_results[eid]["error"] = str(e)
+            if sbatch_stderr:
+                all_results[eid]["sbatch_stderr"] = sbatch_stderr
+        return None
+    except Exception as e:
+        print(
+            f"{RED}{BOLD}sbatch failed:{RESET} {e}",
+            file=sys.stderr,
         )
         for eid in all_results:
-            all_results[eid]["status"] = "generated"
+            all_results[eid]["status"] = "submit_error"
+            all_results[eid]["error"] = str(e)
         return None
 
 
@@ -2108,6 +2340,34 @@ def run_sweep(
                         global_params[key] = float(value)
                     except ValueError:
                         global_params[key] = value
+
+    # Expand ${VAR} templates throughout the config using global params
+    global_params.update(
+        _expand_templates(global_params, global_params)
+    )
+    config["groups"] = _expand_templates(
+        config["groups"], global_params
+    )
+
+    # Re-merge global params into expanded cases so --set overrides
+    # propagate into case_params / pipeline_args.json.
+    # For _-prefixed meta keys, global (with overrides) wins over
+    # stale copies made during load_sweep_config.  For solver params
+    # (no _ prefix), case-specific values still win.
+    for group_data in config["groups"].values():
+        merged_gp = {**group_data["params"]}
+        for k, v in global_params.items():
+            if k.startswith("_") or k not in merged_gp:
+                merged_gp[k] = v
+        group_data["params"] = merged_gp
+
+        for cid, cparams in group_data["expanded_cases"].items():
+            merged_cp = {**cparams}
+            for k, v in global_params.items():
+                if k.startswith("_") or k not in merged_cp:
+                    merged_cp[k] = v
+            group_data["expanded_cases"][cid] = merged_cp
+
     groups = config["groups"]
     
     # Filter groups if group_filter is specified
@@ -2125,19 +2385,18 @@ def run_sweep(
     executable = f"python {script}" if script else None
     
     # Get script directory for PYTHONPATH (for module imports in postproc)
-    # Use first group's script if no global script
-    if script:
-        script_path = Path(script)
-        script_dir = script_path.parent.absolute()
-    else:
-        # Find first group with a _script to get script_dir
+    # Use expanded global _script first, then fall back to group _script
+    resolved_script = global_params.get("_script", script)
+    script_dir = _extract_script_dir(resolved_script)
+    if script_dir is None:
         for group_data in groups.values():
             group_script = group_data["params"].get("_script")
             if group_script:
-                script_dir = Path(group_script).parent.absolute()
-                break
-        else:
-            script_dir = Path(".").absolute()
+                script_dir = _extract_script_dir(group_script)
+                if script_dir is not None:
+                    break
+    if script_dir is None:
+        script_dir = Path(".").absolute()
     
     # Expand ~ to user home directory (works on Unix, Mac, Windows)
     output_dir_str = global_params.get("_output_dir", "./sweep_results")
