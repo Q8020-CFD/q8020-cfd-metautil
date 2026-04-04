@@ -53,4 +53,8 @@ _inject_outdir = "-outdir"
 [bigshots]
 "-shots" = [ 1000, 10000, 100000, 150000 ] 
 
-
+[fvm_1d_nelem_5_sv_shots]
+"-nelem" = 5
+"-shots" = 150000
+"-iters" = 15
+"-initers" = 1
