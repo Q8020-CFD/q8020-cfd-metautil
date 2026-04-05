@@ -2326,20 +2326,32 @@ def run_sweep(
     # Apply CLI overrides to global params
     if overrides:
         for key, value in overrides.items():
+            # Resolve the target key: if a bare key like "job-id" is
+            # given but the TOML already has "--job-id" or "-job-id",
+            # override the existing dashed variant instead of creating
+            # a duplicate.
+            target_key = key
+            if not key.startswith("-"):
+                for prefix in ("--", "-"):
+                    candidate = prefix + key
+                    if candidate in global_params:
+                        target_key = candidate
+                        break
+
             # Coerce "true"/"false" to bool
             if value.lower() == "true":
-                global_params[key] = True
+                global_params[target_key] = True
             elif value.lower() == "false":
-                global_params[key] = False
+                global_params[target_key] = False
             else:
                 # Try int, then float, then keep as string
                 try:
-                    global_params[key] = int(value)
+                    global_params[target_key] = int(value)
                 except ValueError:
                     try:
-                        global_params[key] = float(value)
+                        global_params[target_key] = float(value)
                     except ValueError:
-                        global_params[key] = value
+                        global_params[target_key] = value
 
     # Expand ${VAR} templates throughout the config using global params
     global_params.update(
@@ -2353,11 +2365,20 @@ def run_sweep(
     # propagate into case_params / pipeline_args.json.
     # For _-prefixed meta keys, global (with overrides) wins over
     # stale copies made during load_sweep_config.  For solver params
-    # (no _ prefix), case-specific values still win.
+    # (no _ prefix), case-specific values still win — unless the
+    # global key came from --set and matches a dashed variant
+    # (e.g. --set "job-id=X" should override "--job-id" in the case).
+    override_keys = set(overrides.keys()) if overrides else set()
+
     for group_data in config["groups"].values():
         merged_gp = {**group_data["params"]}
         for k, v in global_params.items():
             if k.startswith("_") or k not in merged_gp:
+                # If this is an override key, also remove any dashed
+                # variant so we don't get duplicates on the CLI.
+                if k in override_keys and not k.startswith("-"):
+                    for pfx in ("--", "-"):
+                        merged_gp.pop(pfx + k, None)
                 merged_gp[k] = v
         group_data["params"] = merged_gp
 
@@ -2365,6 +2386,9 @@ def run_sweep(
             merged_cp = {**cparams}
             for k, v in global_params.items():
                 if k.startswith("_") or k not in merged_cp:
+                    if k in override_keys and not k.startswith("-"):
+                        for pfx in ("--", "-"):
+                            merged_cp.pop(pfx + k, None)
                     merged_cp[k] = v
             group_data["expanded_cases"][cid] = merged_cp
 
