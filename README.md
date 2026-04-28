@@ -1,6 +1,18 @@
 # q8020-cfd-metautil
 
+
 Metadata capture, harvesting, and analysis for quantum CFD experiments.
+
+Here are helper methods to snap useful info from common objects, e.g. a quantum backend, a virtual environment, the running of a solver, and iteration therein.
+
+An "open box" solver can call these metadata capture methods directly. A "closed box" solver can run on its own, and later we can "harvest" the metadata by inspection of the run's outputs. For obvious reasons a "harvester" is usually specific to a solver code.
+
+The "sweeper" is a tool which reads a description of a solver run - in TOML format - and runs it. The description may expand out into a set of runs. It can have post-processing steps (e.g. make a results diagram), and readily utilize virtual environments. 
+
+The solver framework "solverfw" is a recognition that in this study of CFD codes many show a repeated pattern of steps - e.g. looping to convergence, time stepping, circuit quantum state preparation (of various kinds). A lightweight framework can permit a focus on the important algorithms rather than repeated scaffolding. 
+
+Other tools such as metadata search live here too (mostly WIP).
+
 
 ## Metadata schema
 

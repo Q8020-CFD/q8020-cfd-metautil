@@ -34,6 +34,9 @@ def add_backend_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--coupling-map", type=str, default="default",
                         choices=["default", "all-to-all"],
                         help="Coupling map: default (backend's native) or all-to-all (full connectivity) (default: default)")
+    parser.add_argument("--backend-type", type=str, default="sim",
+                        choices=["sim", "fake", "hardware"],
+                        help="Backend execution mode (default: sim)")
 
 
 def add_execution_args(parser: argparse.ArgumentParser) -> None:

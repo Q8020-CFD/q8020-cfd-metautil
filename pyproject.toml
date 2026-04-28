@@ -23,6 +23,8 @@ q8020-sweeper = "q8020_cfd_metautil.sweep:main"
 q8020-harvest = "q8020_cfd_metautil.harvest:main"
 # q8020-compare = "q8020_cfd_metautil.compare:main"
 q8020-metakeys = "q8020_cfd_metautil.metakeys:main"
+q8020-corpus-ingest = "q8020_cfd_metautil.corpus.ingest:main"
+q8020-corpus-viz = "q8020_cfd_metautil.corpus.viz:main"
 
 
 [tool.setuptools.packages.find]

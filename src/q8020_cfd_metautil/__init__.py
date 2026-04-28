@@ -5,4 +5,5 @@ __version__ = "0.1.0"
 __all__ = [
     "args",
     "meta_fragment",
+    "solverfw",
 ]
