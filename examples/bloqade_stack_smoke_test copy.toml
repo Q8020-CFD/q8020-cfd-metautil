@@ -1,0 +1,48 @@
+# FVM Euler 1D Solver - IBM ideal statevector smoke test on Frontier
+#
+# Reproduces the command:
+#   python nozzle_1d_solver.py -nelem 5 -localdt -linsolver HHL \
+#                              -backend ideal statevector -shots 3 -iters 5
+#
+# Apples-to-apples comparison vs. Bloqade's "stack" backend: both are
+# noiseless statevector simulators that sample shots from the exact state.
+#
+# Note: "-backend" is given as a list so build_command_args expands it to
+# the two-token form `-backend ideal statevector` on the CLI. It MUST live
+# in [global] — a list in a case section would be cross-product-expanded
+# into multiple subcases by expand_case_lists.
+
+[global]
+_slurm = true
+_run_mode = "parallel"
+_slurm_project = "ard189"
+_slurm_partition = "batch"
+_slurm_walltime = "02:00:00"
+_slurm_cores_per_task = 1
+_output_dir = "/lustre/orion/ard189/scratch/ishangore/bloqade-test/statevector"
+
+# Optional: broadcast packed conda env to NVMe burst buffer for fast imports
+# Create with: conda-pack -o packed_env.tar.gz
+# _slurm_conda_archive = "/path/to/packed_env.tar.gz"
+
+_env = "~/q8020/fvm_euler_1d_solver/.venv-quantum"
+_script = """\
+source ~/q8020/fvm_euler_1d_solver/.venv-quantum/bin/activate && \
+python3 ~/q8020/fvm_euler_1d_solver/nozzle_1d_solver.py\
+"""
+_case_postproc = [
+    "source ~/venvs/q8020-sweep/bin/activate && python3 ~/q8020/q8020-cfd-experiments/codes/fvm_euler_1d_nozzle/fvm_euler_1d_solver_harvester.py"
+]
+_inject_outdir = "-outdir"
+"-linsolver" = "HHL"
+"-localdt" = true
+"-noshow" = true
+"-backend" = ["ideal", "statevector"]
+"-iters" = 5
+
+# ---------------------------------------------------------------------------
+# Single smoke-test case
+# ---------------------------------------------------------------------------
+[ideal_statevector]
+"-nelem" = 5
+"-shots" = 3
