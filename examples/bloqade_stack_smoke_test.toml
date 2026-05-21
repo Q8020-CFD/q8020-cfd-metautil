@@ -20,7 +20,7 @@ _slurm_project = "ard189"
 _slurm_partition = "batch"
 _slurm_walltime = "02:00:00"
 _slurm_cores_per_task = 1
-_output_dir = "~/bloqade_stack_smoke_test"
+_output_dir = "/lustre/orion/ard189/scratch/ishangore/bloqade-test/bloqade"
 
 # Optional: broadcast packed conda env to NVMe burst buffer for fast imports
 # Create with: conda-pack -o packed_env.tar.gz
