@@ -46,8 +46,11 @@ def add_execution_args(parser: argparse.ArgumentParser) -> None:
     Args:
         parser: ArgumentParser to add arguments to
     """
-    parser.add_argument("--shots", type=int, default=1024,
-                        help="Number of shots (default: 1024)")
+    parser.add_argument("--shots", type=int, default=0,
+                        help="Number of shots; 0 = statevector mode (Aer "
+                             "exact, no sampling).  Use --shots > 0 to "
+                             "exercise the real circuit + measurement "
+                             "path on the configured backend.")
     parser.add_argument("--seed", type=int, default=None,
                         help="Random seed (default: None)")
 
