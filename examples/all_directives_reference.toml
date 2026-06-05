@@ -1,0 +1,231 @@
+# =============================================================================
+# q8020-sweep: ALL DIRECTIVES REFERENCE
+# =============================================================================
+#
+# This file is a kitchen-sink reference: every sweeper directive (`_` key) is
+# listed below with a comment explaining what it does.  It is NOT meant to run
+# as-is -- some keys conflict (e.g. `_run_mode = "sequential"` next to SLURM
+# settings) and `_script` points at a stub that probably doesn't exist on
+# your machine.  Copy the parts you need into a real config.
+#
+# Run:
+#   q8020-sweep examples/all_directives_reference.toml --dry-run
+#
+# =============================================================================
+# Directive naming conventions
+# =============================================================================
+#   `_key`   = sweeper directive (NEVER passed to the solver)
+#   `-key`   = solver CLI flag (becomes `-key value` on the command line)
+#   `key`    = bare key, kept in metadata, not passed to the solver
+#
+# Template variables `${VAR}` in any string value are resolved from `[global]`
+# after `--set` overrides are applied.  Override at the CLI:
+#     q8020-sweep config.toml --set _output_dir=/tmp --set _slurm=false
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# [global] -- defaults inherited by every group
+# -----------------------------------------------------------------------------
+[global]
+
+# --- Execution -------------------------------------------------------------
+
+# Shell command to run for each case.  May include `&&`, pipes, multi-line
+# strings, etc.  If a group sets its own `_script`, that overrides this.
+_script = "python3 examples/smoke_test_solver.py"
+
+# Path to a Python venv.  Auto-activated before `_script` AND captured in the
+# `code` metadata fragment as `library_versions_before/_after` for repro.
+_env = "./.venv"
+
+# Root output directory.  Real layout becomes:
+#     <_output_dir>/<YYYY-MM-DD>/<workflow_id>/<experiment_id>/
+_output_dir = "~/q8020/all_directives_demo"
+
+# "sequential" (default) or "parallel".  Parallel + `_slurm = false` runs
+# cases concurrently on the local machine via sweep_worker subprocesses.
+_run_mode = "sequential"
+
+# Per-case timeout in seconds.  Omit / set null for no timeout.
+_case_timeout = 600
+
+# Replicate every expanded case N times under nested
+# `trial_<i>_<exp_id>/` dirs.  Default 1 (no replication).  Useful for
+# averaging stochastic runs (shot noise, hardware drift).
+_trials = 1
+
+# --- Injection: pass sweep context to the solver ---------------------------
+# Each `_inject_*` names a CLI flag the sweeper appends to `_script`.
+# With the values below, the actual command becomes:
+#     <_script> -outdir <case_dir> -exp <experiment_id> -wf <workflow_id>
+
+_inject_outdir        = "-outdir"   # case output dir
+_inject_experiment_id = "-exp"      # 8-char hex
+_inject_workflow_id   = "-wf"       # `_<8-char hex>`
+
+# --- Hooks (pre/post-processing) -------------------------------------------
+# Each hook receives a JSON context file as its LAST argument, containing:
+#     case_id, experiment_id, workflow_id, case_dir, params
+# Strings containing shell ops (`&&`, `||`, `|`, backticks, `$(...)`) are
+# auto-wrapped in `bash -c`.  Hooks run in the SWEEPER's environment, NOT
+# in `_env` -- if a hook needs a different venv, source it inline.
+# Each hook may be a single string OR a list of strings (run in order).
+
+_case_preproc  = ["echo 'preproc for case'"]                # before each case
+_case_postproc = ["echo 'postproc for case'"]               # after each case
+_group_postproc = ["echo 'postproc after the group finishes'"]
+_final_postproc = ["echo 'final postproc after the whole sweep'"]
+
+# --- SLURM (only effective when _slurm = true) -----------------------------
+
+_slurm             = false          # master switch
+_slurm_interactive = false          # use srun inside an active salloc
+_slurm_project     = "ard189"       # account / project ID
+_slurm_partition   = "batch"        # partition name
+_slurm_walltime    = "00:30:00"     # HH:MM:SS
+_slurm_poll_wait   = 5              # seconds to poll sacct after submit
+
+_slurm_cores_per_task  = 1          # CPUs per srun task
+_slurm_cores_per_node  = 64         # used only in packed (non-exclusive) mode
+_slurm_exclusive_node  = false      # one node per case if true
+                                    # (overrides the cores_per_* knobs)
+
+# Path to a conda-pack archive (.tar.gz) to broadcast to NVMe.  Optional;
+# empty string disables.
+_slurm_conda_archive = ""
+
+# Tar each venv listed here, sbcast to each node's NVMe, auto-rewrite the
+# `_script` activation to use the NVMe path instead of the shared FS.
+_slurm_pack_venvs = []   # e.g. ["./fvm_euler_1d_solver/.venv", "./.venv"]
+
+# Local-parallel poll interval (seconds) for the run_mode=parallel watcher.
+_poll_interval = 2
+
+# --- Free-form template variables (any non-`_` and non-`-` key) ------------
+# These are NOT passed to the solver; they exist only to be referenced as
+# `${VAR}` inside other strings.  Convention: prefix with `_` to make the
+# intent clear, OR use a plain name (the sweeper passes plain names through
+# to the case metadata but not to the solver CLI).
+_solver_dir    = "./fvm_euler_1d_solver"
+_metautil_dir  = "./q8020-cfd-metautil"
+_postproc_venv = "./.venv"
+
+# --- Default solver flags (any `-key`) -------------------------------------
+# These are inherited by every group's cases unless the group overrides.
+"-time_scheme" = "BDF1"
+"-localdt"     = true
+"-noshow"      = true
+
+
+# =============================================================================
+# CROSS-PRODUCT DEMO
+# =============================================================================
+# A "group" is a top-level table that is NOT [global] and NOT under [stage.*].
+# Within a group, ANY parameter whose value is a TOML list expands into the
+# Cartesian product across all list-valued parameters in that group.
+#
+# Naming: cases are auto-named `<group>_<index>` (or `<group>_<i>_trial_<t>`
+# when `_trials > 1`).
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# Group: ideal -- 1 case (no lists, just inherits globals)
+# -----------------------------------------------------------------------------
+[ideal]
+"-nelem" = 5
+# This produces ONE case: ideal_0
+
+
+# -----------------------------------------------------------------------------
+# Group: shots_only -- 3 cases (single list expands)
+# -----------------------------------------------------------------------------
+[shots_only]
+"-nelem" = 5
+"-shots" = [1024, 8192, 65536]
+# This produces THREE cases:
+#   shots_only_0: -nelem 5 -shots 1024
+#   shots_only_1: -nelem 5 -shots 8192
+#   shots_only_2: -nelem 5 -shots 65536
+
+
+# -----------------------------------------------------------------------------
+# Group: cfl_x_shots -- 4 x 2 = 8 cases (TWO lists -> full cross product)
+# -----------------------------------------------------------------------------
+[cfl_x_shots]
+"-nelem" = 5
+"-cfl"   = [1, 5, 10, 25]
+"-shots" = [1024, 8192]
+# This produces EIGHT cases via itertools.product:
+#   cfl_x_shots_0: -cfl 1  -shots 1024
+#   cfl_x_shots_1: -cfl 1  -shots 8192
+#   cfl_x_shots_2: -cfl 5  -shots 1024
+#   cfl_x_shots_3: -cfl 5  -shots 8192
+#   cfl_x_shots_4: -cfl 10 -shots 1024
+#   cfl_x_shots_5: -cfl 10 -shots 8192
+#   cfl_x_shots_6: -cfl 25 -shots 1024
+#   cfl_x_shots_7: -cfl 25 -shots 8192
+
+
+# -----------------------------------------------------------------------------
+# Group: triple_cross -- 3 x 2 x 2 = 12 cases (THREE lists)
+# -----------------------------------------------------------------------------
+[triple_cross]
+"-nelem"    = [3, 5, 8]
+"-shots"    = [1024, 8192]
+"-precond"  = ["jacobi", "ilu"]
+# 3 mesh sizes x 2 shot counts x 2 preconditioners = 12 cases.
+
+
+# -----------------------------------------------------------------------------
+# Group: replicated -- 2 x 5 = 10 runs (cross-product x trial replication)
+# -----------------------------------------------------------------------------
+[replicated]
+"-nelem"  = 5
+"-shots"  = [1024, 8192]
+"_trials" = 5
+# 2 expanded cases, each replicated 5 times. Trial dirs are nested:
+#   replicated/replicated_0/trial_0_<exp_id>/ ... trial_4_<exp_id>/
+#   replicated/replicated_1/trial_0_<exp_id>/ ... trial_4_<exp_id>/
+
+
+# -----------------------------------------------------------------------------
+# Group: per_group_overrides -- shows that group-level keys override globals
+# -----------------------------------------------------------------------------
+[per_group_overrides]
+# Override globals just for this group:
+_script        = "python3 examples/smoke_test_solver.py -greeting hello"
+_case_timeout  = 30
+_case_postproc = ["echo 'group-specific postproc'"]
+
+"-nelem" = [3, 7]
+# 2 cases, each running the overridden script with the overridden timeout
+# and postproc.
+
+
+# =============================================================================
+# MULTI-STAGE PIPELINE (uncomment to use; mutually exclusive with the
+# top-level groups above -- a TOML can have either flat groups OR stages,
+# not both. Stage-style is for `solve -> analyze` pipelines.)
+# =============================================================================
+#
+# [stage.solve]
+# _script = "python3 ./solver.py"
+# _run_mode = "parallel"
+# _inject_outdir = "-outdir"
+# "-nelem" = [3, 5, 8]
+#
+# [stage.solve.basic]                   # group inside the stage
+# "-shots" = 1024
+#
+# [stage.analyze]
+# # `{{stages.<name>.<prop>}}` substitutes from a completed stage.
+# # Available props: run_dir, slurm_job_id
+# _script = "python3 ./analyze.py --input {{stages.solve.run_dir}}"
+#
+# [stage.analyze.report]
+# "-format" = ["pdf", "html"]
+#
+# When `_slurm = true`, stages are chained automatically with
+# `--dependency=afterok:<job_id>` so `analyze` waits for `solve`.
