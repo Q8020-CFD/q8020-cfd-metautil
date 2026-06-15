@@ -2323,7 +2323,11 @@ def run_sweep(
     config = _preloaded_config or load_sweep_config(toml_path)
     global_params = config["global"]
 
-    # Apply CLI overrides to global params
+    # Apply CLI overrides to global params.  Track the *resolved* keys
+    # (after dashed-variant matching) so the re-merge below can correctly
+    # force them into case params even when the override was given bare
+    # (e.g. --set target=hardware -> resolved key "--target").
+    resolved_override_keys: set[str] = set()
     if overrides:
         for key, value in overrides.items():
             # Resolve the target key: if a bare key like "job-id" is
@@ -2337,6 +2341,7 @@ def run_sweep(
                     if candidate in global_params:
                         target_key = candidate
                         break
+            resolved_override_keys.add(target_key)
 
             # Coerce "true"/"false" to bool
             if value.lower() == "true":
@@ -2368,14 +2373,20 @@ def run_sweep(
     # (no _ prefix), case-specific values still win — unless the
     # global key came from --set and matches a dashed variant
     # (e.g. --set "job-id=X" should override "--job-id" in the case).
-    override_keys = set(overrides.keys()) if overrides else set()
+    # Use the keys as resolved during the apply step (dashed-variant
+    # aware), so a bare --set on a dashed solver param still forces its
+    # value into the case.
+    override_keys = resolved_override_keys
 
     for group_data in config["groups"].values():
         merged_gp = {**group_data["params"]}
         for k, v in global_params.items():
-            if k.startswith("_") or k not in merged_gp:
-                # If this is an override key, also remove any dashed
-                # variant so we don't get duplicates on the CLI.
+            # A global key wins over a case param when it is a meta-key,
+            # absent from the case, OR an explicit --set override (which
+            # must beat the stale case copy duplicated at load time).
+            if k.startswith("_") or k not in merged_gp or k in override_keys:
+                # If this is an override key given bare, also remove any
+                # dashed variant so we don't get duplicates on the CLI.
                 if k in override_keys and not k.startswith("-"):
                     for pfx in ("--", "-"):
                         merged_gp.pop(pfx + k, None)
@@ -2385,7 +2396,7 @@ def run_sweep(
         for cid, cparams in group_data["expanded_cases"].items():
             merged_cp = {**cparams}
             for k, v in global_params.items():
-                if k.startswith("_") or k not in merged_cp:
+                if k.startswith("_") or k not in merged_cp or k in override_keys:
                     if k in override_keys and not k.startswith("-"):
                         for pfx in ("--", "-"):
                             merged_cp.pop(pfx + k, None)
