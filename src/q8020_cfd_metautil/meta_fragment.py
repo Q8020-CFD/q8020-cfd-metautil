@@ -422,6 +422,42 @@ def _make_ibm_runtime_backend_meta(backend: Any) -> dict[str, Any]:
                     qargs_key = ",".join(str(q) for q in qargs)
                     gate_error[gate_name][qargs_key] = err
 
+    # Fallback: on some IBM backends (e.g. ibm_kingston) the Target's
+    # InstructionProperties.error is None even though calibration is loaded
+    # -- the gate/readout error rates live in the legacy BackendProperties.
+    # Pull from there so we always capture the error budget, not just T1/T2.
+    # Without this, gate_error/readout_error come back empty and the noise
+    # that dominates deep-circuit hardware runs is unrecorded.
+    if not readout_error or not any(gate_error.values()):
+        try:
+            bprops = backend.properties()
+        except Exception:
+            bprops = None
+        if bprops is not None:
+            if not readout_error:
+                for qubit in range(target.num_qubits):
+                    try:
+                        ro = bprops.readout_error(qubit)
+                    except Exception:
+                        ro = None
+                    if ro is not None:
+                        readout_error[qubit] = ro
+            _virtual = {"measure", "delay", "reset", "if_else", "id",
+                        "measure_2", "rz"}
+            for gate_name in target.operation_names:
+                if gate_name in _virtual or gate_error.get(gate_name):
+                    continue
+                gate_error.setdefault(gate_name, {})
+                for qargs in (target.qargs_for_operation_name(gate_name)
+                              or []):
+                    try:
+                        err = bprops.gate_error(gate_name, list(qargs))
+                    except Exception:
+                        err = None
+                    if err is not None:
+                        qargs_key = ",".join(str(q) for q in qargs)
+                        gate_error[gate_name][qargs_key] = err
+
     return {
         "name": backend.name,
         "vendor": "ibm",
