@@ -1,0 +1,122 @@
+# =====================================================================
+# A-B MUTUAL-RANGE BAKEOFF :  nu = 0.015  (A=0.3, q=6)   [PORTABLE]
+# ---------------------------------------------------------------------
+# Example: ONE file that runs both LOCAL and on SLURM, derived from the
+# q8020-mps-burgers case `burgers_ab_mutual_q6_nu015.toml`.  The trick:
+# every path is built from two literal anchors (_repo, _data_root) and
+# the SLURM block stays dormant until _slurm=true.  Switch environments
+# by overriding ONLY the anchors + flags on the CLI -- never edit the
+# path lines below.
+#
+#   LOCAL  (sequential, as-is):
+#     q8020-sweep examples/burgers_ab_mutual_q6_nu015_portable.toml \
+#       --set _repo=~/projects/githubs/q8020/q8020-mps-burgers
+#
+#   LOCAL  (parallel -- fine for these 4 cases):
+#     q8020-sweep examples/burgers_ab_mutual_q6_nu015_portable.toml \
+#       --set _repo=~/projects/githubs/q8020/q8020-mps-burgers \
+#       --set _run_mode=parallel
+#
+#   SLURM (Frontier):  override the two anchors + flip the switches.
+#     q8020-sweep examples/burgers_ab_mutual_q6_nu015_portable.toml \
+#       --set _repo=/ccs/home/$USER/q8020/q8020-mps-burgers \
+#       --set _data_root=/lustre/orion/ard189/scratch/$USER \
+#       --set _slurm=true --set _run_mode=parallel
+#
+# NOTE: anchors are LITERALS (no nested ${...}) -- template expansion is
+# single-pass, so a ${VAR} pointing at another ${VAR} would not resolve.
+# ${VAR} is resolved from [global] AFTER --set, which is what makes the
+# override cascade into every derived path.  ~ is expanded for paths.
+# =====================================================================
+
+[global]
+
+# --- ANCHORS: the only things that change between local and SLURM -----
+# Path to the q8020-mps-burgers checkout.  Override per-environment.
+_repo      = "~/projects/githubs/q8020/q8020-mps-burgers"
+_data_root = "~/q8020"                                      # output root
+_venv      = "${_repo}/.venv"                               # derived
+
+# --- Everything below derives from anchors -- do NOT edit to switch env
+_output_dir    = "${_data_root}/burgers_ab_mutual_q6_nu015"
+_env           = "${_venv}"
+_script        = "python ${_repo}/src/burgers_solver.py"
+_inject_outdir = "--outdir"
+
+# --- Execution mode ---------------------------------------------------
+# Default sequential = safe everywhere.  Promote to parallel via --set;
+# SLURM REQUIRES _run_mode=parallel (sbatch backgrounds one srun/case).
+_run_mode     = "sequential"
+_trials       = 1
+_case_timeout = 6300   # 1h45m; leaves 15m margin under a 2h walltime
+
+# --- SLURM block: INERT until _slurm=true -----------------------------
+_slurm                = false
+_slurm_project        = "ard189"
+_slurm_partition      = "batch"
+_slurm_walltime       = "02:00:00"
+_slurm_cores_per_task = 1
+_slurm_cores_per_node = 64
+_slurm_exclusive_node = false
+# Packs the SOLVER venv to NVMe (rewrites the solver activation only --
+# the postproc below still runs from the shared-FS ${_venv}).
+_slurm_pack_venvs     = ["${_venv}"]
+
+# --- Dependent post-proc job (Option A) -------------------------------
+# When true (and _slurm=true), the sweeper submits a second, single-node
+# job held by --dependency so _group_postproc + _final_postproc run
+# automatically once the compute job finishes -- no manual step.
+#   afterok  = run only if the compute job succeeded (default)
+#   afterany = run regardless (aggregate partial/failed results)
+_slurm_postproc_job             = false
+_slurm_postproc_dependency_type = "afterok"
+_slurm_postproc_walltime        = "00:30:00"
+
+# --- Solver flags shared by every method ------------------------------
+"--noshow"                  = true
+"--no-classical-reference"  = true
+"--no-analytic-reference"   = true
+
+"--cfl"            = 0.1
+"--evolution-mode" = "measure_reprepare"
+"--segment-size"   = 10
+"--save-every"     = 10
+
+"--bc"           = "periodic"
+"--ic"           = "sine"
+"--source"       = "none"
+"--ic-amplitude" = 0.3
+"--nu"           = 0.015
+
+"--seed"                     = 1234
+"--shots"                    = 150000
+"--metric-transpile-timeout" = 0
+
+"--q"       = 6
+"--n-steps" = 100
+
+# ---------------------------------------------------------------------
+[cole_hopf_circuit]
+"--method"     = "cole_hopf_circuit"
+"--propagator" = "qft-diagonal"
+"--bond-dim"   = 8                      # headroom for peaked phi (smooth here)
+"--phi-modes"  = 8                      # low-pass shot noise before log-deriv
+
+[qlbm_circuit]
+"--method"                      = "qlbm_circuit"
+"--fock-qubits"                 = 3     # qc=3 convergent (qc=2 too coarse)
+"--qalb-collision-trotter-reps" = 0     # dense exact collision = best L2
+
+[lbm_classical]
+"--method" = "lbm"
+
+[ftcs_ref]
+"--method"     = "ftcs_reference"
+"--ref-points" = 800                    # finer than N=64 to stay a faithful ref
+"--save-every" = 10                     # reference must snapshot at the cadence
+
+# ---------------------------------------------------------------------
+# Postproc runs in the SWEEPER's env, NOT _env -- so we call the venv
+# python by explicit ${_venv} path.  Both anchors resolve after --set,
+# so this line is correct in BOTH local and SLURM runs with no edits.
+_group_postproc = ["${_venv}/bin/python ${_repo}/postproc/plot_method_compare.py --anchor qlbm_circuit --hide shift --no-ic"]

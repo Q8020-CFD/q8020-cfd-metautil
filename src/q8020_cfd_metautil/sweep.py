@@ -2016,6 +2016,170 @@ def _finalize_slurm(
 
 
 # ---------------------------------------------------------------------------
+# Dependent SLURM post-processing job (group + final aggregation)
+# ---------------------------------------------------------------------------
+
+# Dependency types accepted for the post-proc job.  ``afterok`` runs the job
+# only if the compute job succeeded; ``afterany`` runs it regardless (useful
+# for aggregating partial/failed results).
+_VALID_POSTPROC_DEP_TYPES = {"afterok", "afterany"}
+
+
+def _generate_postproc_sbatch(
+    run_dir: Path,
+    global_params: dict[str, Any],
+    dependency_job_id: str,
+    dep_type: str = "afterok",
+) -> str:
+    """Generate a single-node sbatch that runs group + final post-proc.
+
+    The job is held in the queue via ``--dependency=<dep_type>:<id>`` until the
+    compute job finishes, then runs :mod:`q8020_cfd_metautil.sweep_postproc`
+    directly on the batch node (no ``srun`` fan-out -- this is a lightweight
+    serial aggregation step).
+
+    Unlike the compute job, this script does NOT replay ``_slurm_pack_venvs``
+    NVMe broadcasting: post-proc commands are expected to reference a
+    shared-filesystem interpreter (e.g. ``${_venv}/bin/python``), which is
+    reachable from the batch node without staging.
+
+    Returns the sbatch script content as a string.
+    """
+    if dep_type not in _VALID_POSTPROC_DEP_TYPES:
+        raise ValueError(
+            f"_slurm_postproc_dependency_type must be one of "
+            f"{sorted(_VALID_POSTPROC_DEP_TYPES)}, got {dep_type!r}"
+        )
+
+    project = global_params.get("_slurm_project", "<PROJECT_ID>")
+    walltime = global_params.get("_slurm_postproc_walltime", "00:30:00")
+    partition = global_params.get("_slurm_partition", "batch")
+    conda_archive = global_params.get("_slurm_conda_archive", "")
+
+    # Shared-FS environment bootstrap (mirrors the compute job's conda path,
+    # but never the packed-venv NVMe staging).
+    env_section = ""
+    if conda_archive:
+        env_section = f"""\
+# --- SBCAST conda environment to NVMe ---
+ENV_ARCHIVE={conda_archive}
+ENV_NAME=sweep_conda_env
+NVME_ENV_PATH=/mnt/bb/${{USER}}/${{ENV_NAME}}
+
+echo "Broadcasting conda env to ${{SLURM_NNODES}} nodes..."
+sbcast -pf $ENV_ARCHIVE /mnt/bb/${{USER}}/${{ENV_NAME}}.tar.gz
+if [ "$?" != "0" ]; then
+    echo "ERROR: sbcast failed"
+    exit 1
+fi
+
+srun -N ${{SLURM_NNODES}} --ntasks-per-node 1 \\
+    mkdir -p $NVME_ENV_PATH
+srun -N ${{SLURM_NNODES}} --ntasks-per-node 1 \\
+    tar -xzf /mnt/bb/${{USER}}/${{ENV_NAME}}.tar.gz \\
+    -C $NVME_ENV_PATH
+
+source ${{NVME_ENV_PATH}}/bin/activate
+
+echo "Environment ready"
+echo ""
+"""
+
+    script = f"""\
+#!/bin/bash
+#SBATCH -J q8020_postproc
+#SBATCH -A {project}
+#SBATCH -t {walltime}
+#SBATCH -N 1
+#SBATCH -C nvme
+#SBATCH -p {partition}
+#SBATCH -o {run_dir}/slurm_postproc_%j.out
+#SBATCH -e {run_dir}/slurm_postproc_%j.err
+#SBATCH --dependency={dep_type}:{dependency_job_id}
+
+echo "Job ID:     $SLURM_JOB_ID"
+echo "Depends on: {dependency_job_id} ({dep_type})"
+echo "Start:      $(date)"
+echo ""
+
+cd $SLURM_SUBMIT_DIR || exit 1
+
+{env_section}
+# --- Run group + final post-processing (serial, on the batch node) ---
+python3 -m q8020_cfd_metautil.sweep_postproc {run_dir}
+STATUS=$?
+
+echo ""
+echo "Post-processing finished with status $STATUS."
+exit $STATUS
+"""
+    return script
+
+
+def _finalize_slurm_postproc(
+    run_dir: Path,
+    global_params: dict[str, Any],
+    compute_job_id: str,
+    dep_type: str = "afterok",
+    dry_run: bool = False,
+) -> str | None:
+    """Submit the dependent post-proc job for a SLURM sweep.
+
+    Args:
+        compute_job_id: The SLURM job ID this post-proc job must wait for.
+        dep_type: Dependency type (``afterok`` or ``afterany``).
+
+    Returns:
+        The post-proc SLURM job ID if submitted, otherwise ``None``.
+    """
+    sbatch_content = _generate_postproc_sbatch(
+        run_dir, global_params, compute_job_id, dep_type,
+    )
+    sbatch_file = run_dir / "q8020_postproc.sbatch"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    with open(sbatch_file, "w", encoding="utf-8") as f:
+        f.write(sbatch_content)
+
+    print(f"{CYAN}Generated:{RESET} {sbatch_file}")
+    print(
+        f"{DIM}post-proc job depends on {compute_job_id}"
+        f" ({dep_type}){RESET}"
+    )
+
+    if dry_run:
+        return None
+
+    try:
+        sub = subprocess.run(
+            ["sbatch", str(sbatch_file)],
+            capture_output=True, text=True,
+            check=True,
+        )
+        job_line = sub.stdout.strip()
+        print(f"{GREEN}{BOLD}Submitted postproc:{RESET} {job_line}")
+        return _parse_slurm_job_id(job_line)
+    except subprocess.CalledProcessError as e:
+        sbatch_stderr = (e.stderr or "").strip()
+        print(
+            f"{RED}{BOLD}postproc sbatch failed:{RESET} {e}",
+            file=sys.stderr,
+        )
+        if sbatch_stderr:
+            print(sbatch_stderr, file=sys.stderr)
+        error_log = run_dir / "slurm_postproc_submit_error.log"
+        with open(error_log, "w", encoding="utf-8") as f:
+            f.write(f"sbatch failed with exit code {e.returncode}\n\n")
+            f.write(sbatch_stderr or "(no stderr captured)")
+        return None
+    except Exception as e:
+        print(
+            f"{RED}{BOLD}postproc sbatch failed:{RESET} {e}",
+            file=sys.stderr,
+        )
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Sweep configuration and execution
 # ---------------------------------------------------------------------------
 
@@ -2583,6 +2747,7 @@ def run_sweep(
                     "run_dir": str(run_dir),
                     "case_dirs": case_dirs_list,
                     "params": group_params,
+                    "script_dir": str(script_dir),
                 }
                 postproc_json = (
                     run_dir
@@ -2593,10 +2758,18 @@ def run_sweep(
                         postproc_json, "w", encoding="utf-8"
                     ) as f:
                         json.dump(postproc_data, f, indent=2)
-                print(
-                    f"\n  {YELLOW}Group postproc"
-                    f" (run manually):{RESET}"
-                )
+                if use_slurm and global_params.get(
+                    "_slurm_postproc_job", False
+                ):
+                    print(
+                        f"\n  {YELLOW}Group postproc"
+                        f" (dependent SLURM job):{RESET}"
+                    )
+                else:
+                    print(
+                        f"\n  {YELLOW}Group postproc"
+                        f" (run manually):{RESET}"
+                    )
                 for pp_cmd in group_postproc:
                     print(
                         f"    {pp_cmd} {postproc_json}"
@@ -2886,6 +3059,7 @@ def run_sweep(
                     str(d) for d in group_case_dirs
                 ],
                 "params": group_params,
+                "script_dir": str(script_dir),
             }
             postproc_json = (
                 run_dir / f"_group_postproc_{group_id}.json"
@@ -2948,6 +3122,7 @@ def run_sweep(
             "case_dirs": [str(d) for d in all_case_dirs],
             "groups": list(groups.keys()),
             "global_params": global_params,
+            "script_dir": str(script_dir),
         }
         final_postproc_json = run_dir / "_final_postproc.json"
         if not dry_run:
@@ -2957,11 +3132,20 @@ def run_sweep(
                 json.dump(final_postproc_data, f, indent=2)
 
         if run_mode == "parallel":
-            # Print command only, don't run
-            print(
-                f"{YELLOW}Final postproc"
-                f" (run manually):{RESET}"
-            )
+            # Print command only, don't run inline (a dependent SLURM job
+            # runs it later when _slurm_postproc_job is set).
+            if use_slurm and global_params.get(
+                "_slurm_postproc_job", False
+            ):
+                print(
+                    f"{YELLOW}Final postproc"
+                    f" (dependent SLURM job):{RESET}"
+                )
+            else:
+                print(
+                    f"{YELLOW}Final postproc"
+                    f" (run manually):{RESET}"
+                )
             for fp_cmd in final_postproc:
                 print(f"  {fp_cmd} {final_postproc_json}")
         else:
@@ -2975,7 +3159,35 @@ def run_sweep(
             )
             results["_final_postproc"] = fp_results
         print()
-    
+
+    # Dependent SLURM post-proc job: submit a single -N 1 job (held by
+    # --dependency) that runs group + final post-proc once the compute job
+    # finishes.  Opt-in via _slurm_postproc_job; all context JSONs it needs
+    # were written above (group JSONs in the loop, final JSON just now).
+    if (
+        use_slurm
+        and slurm_job_id
+        and global_params.get("_slurm_postproc_job", False)
+    ):
+        has_group_pp = any(
+            gd["params"].get("_group_postproc")
+            for gd in groups.values()
+        )
+        has_any_pp = has_group_pp or bool(
+            global_params.get("_final_postproc")
+        )
+        if has_any_pp:
+            dep_type = global_params.get(
+                "_slurm_postproc_dependency_type", "afterok"
+            )
+            postproc_job_id = _finalize_slurm_postproc(
+                run_dir, global_params, slurm_job_id,
+                dep_type, dry_run,
+            )
+            if postproc_job_id:
+                results["slurm_postproc_job_id"] = postproc_job_id
+            print()
+
     # Record sweep end time and save overall results
     sweep_end_time = _get_iso_timestamp()
     results["end_time"] = sweep_end_time

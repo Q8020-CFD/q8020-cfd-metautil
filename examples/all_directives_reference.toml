@@ -31,38 +31,24 @@
 
 # --- Execution -------------------------------------------------------------
 
-# Shell command to run for each case.  May include `&&`, pipes, multi-line
-# strings, etc.  If a group sets its own `_script`, that overrides this.
-_script = "python3 examples/smoke_test_solver.py"
-
-# Path to a Python venv.  Auto-activated before `_script` AND captured in the
-# `code` metadata fragment as `library_versions_before/_after` for repro.
-_env = "./.venv"
+_script       = "python3 examples/smoke_test_solver.py"  # cmd per case; group _script overrides
+_env          = "./.venv"          # venv: auto-activated + captured in `code` metadata for repro
+_run_mode     = "sequential"       # "sequential" (default) or "parallel" (local concurrent)
+_case_timeout = 600                # per-case timeout in seconds; null = no timeout
+_trials       = 1                  # replicate each expanded case N times (stochastic averaging)
 
 # Root output directory.  Real layout becomes:
 #     <_output_dir>/<YYYY-MM-DD>/<workflow_id>/<experiment_id>/
 _output_dir = "~/q8020/all_directives_demo"
-
-# "sequential" (default) or "parallel".  Parallel + `_slurm = false` runs
-# cases concurrently on the local machine via sweep_worker subprocesses.
-_run_mode = "sequential"
-
-# Per-case timeout in seconds.  Omit / set null for no timeout.
-_case_timeout = 600
-
-# Replicate every expanded case N times under nested
-# `trial_<i>_<exp_id>/` dirs.  Default 1 (no replication).  Useful for
-# averaging stochastic runs (shot noise, hardware drift).
-_trials = 1
 
 # --- Injection: pass sweep context to the solver ---------------------------
 # Each `_inject_*` names a CLI flag the sweeper appends to `_script`.
 # With the values below, the actual command becomes:
 #     <_script> -outdir <case_dir> -exp <experiment_id> -wf <workflow_id>
 
-_inject_outdir        = "-outdir"   # case output dir
-_inject_experiment_id = "-exp"      # 8-char hex
-_inject_workflow_id   = "-wf"       # `_<8-char hex>`
+_inject_outdir        = "-outdir"   # flag for the case output dir
+_inject_experiment_id = "-exp"      # flag for the experiment id (8-char hex)
+_inject_workflow_id   = "-wf"       # flag for the workflow id (`_<8-char hex>`)
 
 # --- Hooks (pre/post-processing) -------------------------------------------
 # Each hook receives a JSON context file as its LAST argument, containing:
@@ -72,10 +58,10 @@ _inject_workflow_id   = "-wf"       # `_<8-char hex>`
 # in `_env` -- if a hook needs a different venv, source it inline.
 # Each hook may be a single string OR a list of strings (run in order).
 
-_case_preproc  = ["echo 'preproc for case'"]                # before each case
-_case_postproc = ["echo 'postproc for case'"]               # after each case
-_group_postproc = ["echo 'postproc after the group finishes'"]
-_final_postproc = ["echo 'final postproc after the whole sweep'"]
+_case_preproc   = ["echo 'preproc for case'"]                   # before each case
+_case_postproc  = ["echo 'postproc for case'"]                  # after each case
+_group_postproc = ["echo 'postproc after the group finishes'"]  # after each group
+_final_postproc = ["echo 'final postproc after the whole sweep'"]  # once at the end
 
 # --- SLURM (only effective when _slurm = true) -----------------------------
 
@@ -91,15 +77,20 @@ _slurm_cores_per_node  = 64         # used only in packed (non-exclusive) mode
 _slurm_exclusive_node  = false      # one node per case if true
                                     # (overrides the cores_per_* knobs)
 
-# Path to a conda-pack archive (.tar.gz) to broadcast to NVMe.  Optional;
-# empty string disables.
-_slurm_conda_archive = ""
-
 # Tar each venv listed here, sbcast to each node's NVMe, auto-rewrite the
 # `_script` activation to use the NVMe path instead of the shared FS.
 _slurm_pack_venvs = []   # e.g. ["./fvm_euler_1d_solver/.venv", "./.venv"]
 
-# Local-parallel poll interval (seconds) for the run_mode=parallel watcher.
+# Path to a conda-pack archive (.tar.gz) to broadcast to NVMe.  Optional;
+# empty string disables.  Ignored if _slurm_pack_venvs is set (that takes
+# precedence).
+_slurm_conda_archive = ""
+
+# --- End of SLURM block. ---------------------------------------------------
+
+# --- Local parallel execution ----------------------------------------------
+# Poll interval (seconds) for the run_mode=parallel watcher.  Used when
+# _slurm = false and _run_mode = "parallel"; ignored under SLURM.
 _poll_interval = 2
 
 # --- Free-form template variables (any non-`_` and non-`-` key) ------------
@@ -107,15 +98,15 @@ _poll_interval = 2
 # `${VAR}` inside other strings.  Convention: prefix with `_` to make the
 # intent clear, OR use a plain name (the sweeper passes plain names through
 # to the case metadata but not to the solver CLI).
-_solver_dir    = "./fvm_euler_1d_solver"
-_metautil_dir  = "./q8020-cfd-metautil"
-_postproc_venv = "./.venv"
+_solver_dir    = "./fvm_euler_1d_solver"   # referenced elsewhere as ${_solver_dir}
+_metautil_dir  = "./q8020-cfd-metautil"    # referenced elsewhere as ${_metautil_dir}
+_postproc_venv = "./.venv"                 # referenced elsewhere as ${_postproc_venv}
 
 # --- Default solver flags (any `-key`) -------------------------------------
-# These are inherited by every group's cases unless the group overrides.
-"-time_scheme" = "BDF1"
-"-localdt"     = true
-"-noshow"      = true
+# Inherited by every group's cases unless the group overrides.
+"-time_scheme" = "BDF1"     # forwarded to solver as `-time_scheme BDF1`
+"-localdt"     = true       # bare `-localdt` flag (boolean true = present)
+"-noshow"      = true       # bare `-noshow` flag
 
 
 # =============================================================================
