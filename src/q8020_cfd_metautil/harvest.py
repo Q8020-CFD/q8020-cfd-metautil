@@ -44,6 +44,9 @@ from q8020_cfd_metautil.meta_fragment import (
     write_results,
 )
 
+from q8020_cfd_metautil.metakeys import _walk_case_dirs
+
+
 # Re-export patterns for use by other modules
 __all__ = [
     "harvest_metadata",
@@ -305,7 +308,7 @@ def _harvest_one(
         output_path = source_dir / "metadata.json"
 
     # Roll up fragments.
-    metadata, warnings, fragment_counts = harvest_metadata(
+    metadata, warnings, _ = harvest_metadata(
         write_dir, read_only=False,
     )
 
@@ -320,7 +323,6 @@ def _harvest_one(
 
 
 def main() -> None:
-    from q8020_cfd_metautil.metakeys import _walk_case_dirs
 
     parser = argparse.ArgumentParser(
         description=(

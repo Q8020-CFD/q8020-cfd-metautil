@@ -33,7 +33,7 @@ Module layout under `q8020_cfd_metautil.solverfw`:
 
 | Module | Public surface | Role |
 |---|---|---|
-| `config` | `SolverConfig` (ABC) | dataclass base for run-time config (cfl, dt, n_steps, bc, method, output_dir, save_every, free-form `extra` dict). Subclasses add equation-specific fields. |
+| `config` | `SolverConfig` (ABC) | dataclass base for run-time config (cfl, dt, n_steps, conv_tol, bc, method, output_dir, save_every, free-form `extra` dict). Subclasses add equation-specific fields. |
 | `grid` | `Grid` (ABC), `Grid1D` (concrete) | spatial discretisation. `Grid1D.from_qubits(q)` builds an N=2^q grid for quantum solvers; `Grid1D.uniform(nelem)` builds an arbitrary uniform grid. |
 | `state` | `State` (Protocol), `DenseState` | minimal contract: `to_dense()`, `copy()`, `shape`. Default impl wraps a numpy array; alternate states (MPS, statevector) implement the protocol. |
 | `spatial` | `SpatialOperator` (ABC) | `compute_rhs(state, grid, config, t) -> np.ndarray` — the spatial discretisation (FD, FV, spectral). Optional `compute_timestep(state, grid, cfl)` for CFL-driven dt. |
@@ -96,14 +96,18 @@ Data flow at run-time:
 
 `MainLoop.run()` ([loop.py:25](../src/q8020_cfd_metautil/solverfw/loop.py:25))
 is the single source of truth for the time-stepping skeleton. It
-calls `integrator.step()` `n_steps` times, after each step records
-the dense solution, fires the post-processor's `on_step`, checks
-for `NaN` (divergence — pads with NaN and breaks), and checks for a
-`residual_ratio` key in metrics below `config.conv_tol` (convergence
-— pads with the last good state and breaks).
+calls `integrator.step()` `n_steps` times; after each step it fires the
+post-processor's `on_step`, checks for `NaN` (divergence — pads with NaN
+and breaks), checks for a `residual_ratio` key in metrics below
+`config.conv_tol` (convergence — pads with the last good state and
+breaks), and records the dense solution.
 
 Returns `(solutions: list[np.ndarray], step_metrics: list[dict] | None)`.
-Both are length `n_steps + 1` (initial + per-step) on a clean run.
+`solutions` is length `n_steps + 1` (initial state + one per step) on a
+clean run. `step_metrics` collects only the non-empty metrics dicts, so
+it is at most `n_steps` long and is `None` when every step returns `{}`
+(as `ForwardEuler` does — its metrics come from the post-processor, not
+the integrator).
 
 This is one "experiment" - running a case with a code on a backend. The q8020 sweeper can take a parameterized description of a set of runs, and expand them out into these individual atomic experiments. Each experiment is composed of a pluggable set of the above piece part components. 
 
@@ -135,6 +139,10 @@ class MyEqnConfig(SolverConfig):
 dict for free-form metadata. There is also a no-op `setup()` hook
 for derived setup (e.g., compute inlet primitives from raw config
 once at construction time).
+
+Note: `MainLoop` records every step's solution and does not itself act
+on `save_every` — that field is advisory for a `PostProcessor` to honor
+when deciding a snapshot cadence.
 
 ### 4.2 Implement `SpatialOperator`
 

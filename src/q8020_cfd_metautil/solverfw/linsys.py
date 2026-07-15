@@ -24,6 +24,9 @@ class LUSolver(LinearSystemSolver):
     """Direct solve via scipy LU factorisation."""
 
     def solve(self, A, b):
+        # Lazy import: defer scipy's import cost until a concrete solver is
+        # actually used, keeping solverfw startup lean. scipy is a declared
+        # dependency, so it is available when needed.
         import scipy.linalg
         x = scipy.linalg.solve(A, b)
         return x, {}
@@ -36,6 +39,7 @@ class GMRESSolver(LinearSystemSolver):
         self.tol = tol
 
     def solve(self, A, b):
+        # Lazy import: see LUSolver.solve -- scipy is optional.
         import scipy.sparse.linalg as spla
         x, info = spla.gmres(A, b, rtol=self.tol)
         return x, {"gmres_info": int(info)}

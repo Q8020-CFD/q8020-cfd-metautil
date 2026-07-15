@@ -10,11 +10,13 @@ requires-python = ">=3.9"
 dependencies = [
     "matplotlib",
     "numpy",
+    "scipy",
     "duckdb",
     "streamlit",
     "plotly",
     "watchdog",
-    "subprocess-tee"
+    "subprocess-tee",
+    "pytest"
 ]
 
 [project.scripts]
@@ -22,13 +24,19 @@ q8020-sweep = "q8020_cfd_metautil.sweep:main"
 q8020-sweeper = "q8020_cfd_metautil.sweep:main"
 q8020-harvest = "q8020_cfd_metautil.harvest:main"
 # q8020-compare = "q8020_cfd_metautil.compare:main"
-q8020-metakeys = "q8020_cfd_metautil.metakeys:main"
-q8020-corpus-ingest = "q8020_cfd_metautil.corpus.ingest:main"
-q8020-corpus-viz = "q8020_cfd_metautil.corpus.viz:main"
+# q8020-metakeys = "q8020_cfd_metautil.metakeys:main"
+# q8020-corpus-ingest = "q8020_cfd_metautil.corpus.ingest:main"
+# q8020-corpus-viz = "q8020_cfd_metautil.corpus.viz:main"
 
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
+extraPaths = ["src"]
+exclude = ["tests"]
 
 [tool.pylint.messages_control]
 disable = [
@@ -37,4 +45,7 @@ disable = [
     "C0303",  # trailing-whitespace
     "C0301",  # line-too-long
     "W0621",  # redefined-outer-name
+    "C0116",  # Missing function or method docstring
+    "W0718",  # broad-exception-caught
+    "C0302",  # too-many-lines
 ]

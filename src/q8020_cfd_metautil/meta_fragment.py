@@ -4,9 +4,10 @@ Provides:
     ID generation: generate_experiment_id, generate_workflow_id
     User/env capture: make_user_meta, make_library_meta
     Dict builders: make_experiment_meta, make_case_meta, make_code_meta,
-                   make_backend_meta, make_axequalsb_case
+                   make_axequalsb_case
     Fragment I/O: write_fragment, write_experiment, ..., read_fragments
     Constants: VALID_SECTIONS, SINGLETON_SECTIONS, MULTI_SECTIONS
+    Contracts: BackendMeta (neutral backend-metadata shape)
 
 Usage:
     from q8020_cfd_metautil.meta_fragment import (
@@ -15,6 +16,8 @@ Usage:
     data = make_experiment_meta(name="my_run")
     write_experiment(outdir, data)
 """
+
+from __future__ import annotations
 
 import getpass
 import importlib.metadata
@@ -25,7 +28,7 @@ import socket
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -49,6 +52,41 @@ MULTI_SECTIONS = frozenset(["artifacts", "exec_stats", "results", "analysis"])
 # Also: q8020_sweep_{section}_{index}.json or q8020_sweep_{section}_{exp_id}_{index}.json
 FRAGMENT_PATTERN = re.compile(r"^q8020_([a-z_]+)_(?:([a-f0-9]{8})_)?(\d+)\.json$")
 SWEEP_FRAGMENT_PATTERN = re.compile(r"^q8020_sweep_([a-z_]+)_(?:([a-f0-9]{8})_)?(\d+)\.json$")
+
+
+# ---------------------------------------------------------------------------
+# Backend metadata contract
+# ---------------------------------------------------------------------------
+
+class BackendMeta(TypedDict, total=False):
+    """
+    Neutral, vendor-agnostic shape of the "backend" metadata section.
+
+    This is the contract that vendor-specific code fills in and that
+    ``write_backend`` consumes. metautil is a pure core: it does not know
+    how to build this dict from any concrete backend object -- it only
+    reads and writes it. The actual extraction lives in vendor packages
+    (e.g. ``q8020_backend_utils.ibm.backend_meta.make_backend_meta``),
+    which produce a dict conforming to this shape.
+
+    Required fields: ``name``, ``vendor``, ``type``, ``noise``. All other
+    fields are optional (``total=False``); vendors include whatever their
+    hardware/simulator exposes.
+    """
+
+    name: str  # backend name
+    vendor: str  # e.g. "ibm" -- the vendor that produced this backend
+    type: str  # "simulator" | "hardware"
+    noise: bool  # whether a noise model is active
+    num_qubits: int
+    coupling_map: list[list[int]] | None  # list of 2-element [a, b] edges
+    basis_gates: list[str]
+    t1: dict[int, float] | None  # per-qubit, MICROSECONDS
+    t2: dict[int, float] | None  # per-qubit, microseconds
+    readout_error: dict | None  # per-qubit; shape varies by vendor
+    gate_error: dict | None  # {gate_name: {"q0,q1": error_rate}}
+    dt: float | None  # sample time (seconds)
+    captured_at: str  # ISO-8601 UTC timestamp
 
 
 # ---------------------------------------------------------------------------
@@ -213,311 +251,6 @@ def make_code_meta(
         code["run_args"] = run_args
     code.update(extras)
     return code
-
-
-def _make_ibm_backend_meta(backend: Any) -> dict[str, Any]:
-    """
-    Build backend dict for IBM/Qiskit AerSimulator backends.
-
-    Extracts noise model details (T1, T2, gate errors, readout
-    errors) when the simulator was constructed from a fake or
-    real backend via AerSimulator.from_backend().
-    """
-    info: dict[str, Any] = {
-        "name": backend.name,
-        "vendor": "ibm",
-        "type": "simulator",
-    }
-
-    options = backend.options
-    has_noise = (
-        hasattr(options, "noise_model")
-        and options.noise_model is not None
-    )
-    info["noise"] = has_noise
-
-    # Num qubits
-    if hasattr(backend, "num_qubits"):
-        info["num_qubits"] = backend.num_qubits
-
-    # Coupling map: try configuration() first, then options
-    try:
-        cfg = backend.configuration()
-        cm = getattr(cfg, "coupling_map", None)
-        if cm is not None:
-            info["coupling_map"] = [list(e) for e in cm]
-    except Exception:
-        pass
-    if "coupling_map" not in info:
-        cm = getattr(options, "coupling_map", None)
-        if cm is not None:
-            if hasattr(cm, "get_edges"):
-                info["coupling_map"] = [
-                    list(e) for e in cm.get_edges()
-                ]
-            else:
-                info["coupling_map"] = cm
-
-    # Basis gates: prefer noise model (real hw gates) over
-    # configuration (includes all simulator builtins).
-    if has_noise:
-        noise_model = options.noise_model
-        bg = getattr(noise_model, "basis_gates", None)
-        if bg:
-            info["basis_gates"] = list(bg)
-    if "basis_gates" not in info:
-        bg = getattr(options, "basis_gates", None)
-        if bg is not None:
-            info["basis_gates"] = list(bg)
-    if "basis_gates" not in info:
-        try:
-            cfg = backend.configuration()
-            bg = getattr(cfg, "basis_gates", None)
-            if bg is not None:
-                info["basis_gates"] = list(bg)
-        except Exception:
-            pass
-
-    # Extract noise model details (errors per qubit/gate)
-    if has_noise:
-        _extract_noise_model_details(info, noise_model)
-
-    # Extract per-qubit T1/T2 and dt from target (available when
-    # simulator was built via AerSimulator.from_backend()).
-    target = getattr(backend, "target", None)
-    if target is not None:
-        qubit_props = getattr(target, "qubit_properties", None)
-        if qubit_props:
-            t1: dict[int, float] = {}
-            t2: dict[int, float] = {}
-            for qubit in range(target.num_qubits):
-                if qubit < len(qubit_props) and qubit_props[qubit]:
-                    props = qubit_props[qubit]
-                    if hasattr(props, "t1") and props.t1 is not None:
-                        t1[qubit] = props.t1 * 1e6  # seconds -> µs
-                    if hasattr(props, "t2") and props.t2 is not None:
-                        t2[qubit] = props.t2 * 1e6
-            if t1:
-                info["t1"] = t1
-            if t2:
-                info["t2"] = t2
-        dt = getattr(target, "dt", None)
-        if dt is not None:
-            info["dt"] = dt
-
-    return info
-
-
-def _extract_noise_model_details(
-    info: dict[str, Any],
-    noise_model: Any,
-) -> None:
-    """Extract T1, T2, gate errors, readout errors from noise model."""
-    try:
-        nm_dict = noise_model.to_dict()
-        readout_errors: dict[int, list[float]] = {}
-        gate_error_summary: dict[str, dict[str, float]] = {}
-
-        for entry in nm_dict.get("errors", []):
-            etype = entry.get("type", "")
-            gate_qubits = entry.get("gate_qubits", [])
-            qubits = gate_qubits[0] if gate_qubits else ()
-            ops = entry.get("operations", [])
-            gate = ops[0] if ops else ""
-
-            if etype == "roerror" and len(qubits) == 1:
-                probs = entry.get("probabilities", [])
-                if len(probs) >= 2:
-                    readout_errors[qubits[0]] = [
-                        float(probs[0][1])
-                        if len(probs[0]) > 1 else 0.0,
-                        float(probs[1][0])
-                        if len(probs[1]) > 0 else 0.0,
-                    ]
-
-            if etype == "qerror" and gate:
-                qargs_key = ",".join(
-                    str(q) for q in qubits
-                )
-                if gate not in gate_error_summary:
-                    gate_error_summary[gate] = {}
-                probs = entry.get("probabilities", [])
-                if probs and len(probs) > 1:
-                    gate_error_summary[gate][
-                        qargs_key
-                    ] = round(1.0 - float(probs[0]), 8)
-
-        if readout_errors:
-            info["readout_error"] = readout_errors
-        if gate_error_summary:
-            info["gate_error"] = gate_error_summary
-    except Exception:
-        # Noise model extraction is best-effort
-        pass
-
-
-def _get_prop(props: Any, key: str) -> Any:
-    """Extract a property from an InstructionProperties or dict."""
-    if isinstance(props, dict):
-        return props.get(key)
-    return getattr(props, key, None)
-
-
-def _make_ibm_runtime_backend_meta(backend: Any) -> dict[str, Any]:
-    """
-    Build backend dict for IBM Runtime backends (real hardware).
-
-    Args:
-        backend: IBMBackend instance from qiskit_ibm_runtime
-
-    Returns:
-        Backend dict ready for write_backend
-    """
-    target = backend.target
-
-    # Coupling map as list of edges
-    coupling_map = None
-    cm = target.build_coupling_map()
-    if cm is not None:
-        coupling_map = [list(edge) for edge in cm.get_edges()]
-
-    # Per-qubit properties
-    t1: dict[int, float] = {}
-    t2: dict[int, float] = {}
-    readout_error: dict[int, float] = {}
-
-    for qubit in range(target.num_qubits):
-        qubit_props = target.qubit_properties
-        if (
-            qubit_props
-            and qubit < len(qubit_props)
-            and qubit_props[qubit]
-        ):
-            props = qubit_props[qubit]
-            t1_val = _get_prop(props, "t1")
-            if t1_val is not None:
-                t1[qubit] = t1_val * 1e6
-            t2_val = _get_prop(props, "t2")
-            if t2_val is not None:
-                t2[qubit] = t2_val * 1e6
-
-        if "measure" in target.operation_names:
-            measure_props = target.get("measure", (qubit,))
-            if measure_props:
-                err = _get_prop(measure_props, "error")
-                if err is not None:
-                    readout_error[qubit] = err
-
-    # Per-gate errors
-    gate_error: dict[str, dict[str, float]] = {}
-    for gate_name in target.operation_names:
-        if gate_name == "measure":
-            continue
-        gate_error[gate_name] = {}
-        for qargs in (target.qargs_for_operation_name(gate_name) or []):
-            props = target.get(gate_name, qargs)
-            if props:
-                err = _get_prop(props, "error")
-                if err is not None:
-                    qargs_key = ",".join(str(q) for q in qargs)
-                    gate_error[gate_name][qargs_key] = err
-
-    # Fallback: on some IBM backends (e.g. ibm_kingston) the Target's
-    # InstructionProperties.error is None even though calibration is loaded
-    # -- the gate/readout error rates live in the legacy BackendProperties.
-    # Pull from there so we always capture the error budget, not just T1/T2.
-    # Without this, gate_error/readout_error come back empty and the noise
-    # that dominates deep-circuit hardware runs is unrecorded.
-    if not readout_error or not any(gate_error.values()):
-        try:
-            bprops = backend.properties()
-        except Exception:
-            bprops = None
-        if bprops is not None:
-            if not readout_error:
-                for qubit in range(target.num_qubits):
-                    try:
-                        ro = bprops.readout_error(qubit)
-                    except Exception:
-                        ro = None
-                    if ro is not None:
-                        readout_error[qubit] = ro
-            _virtual = {"measure", "delay", "reset", "if_else", "id",
-                        "measure_2", "rz"}
-            for gate_name in target.operation_names:
-                if gate_name in _virtual or gate_error.get(gate_name):
-                    continue
-                gate_error.setdefault(gate_name, {})
-                for qargs in (target.qargs_for_operation_name(gate_name)
-                              or []):
-                    try:
-                        err = bprops.gate_error(gate_name, list(qargs))
-                    except Exception:
-                        err = None
-                    if err is not None:
-                        qargs_key = ",".join(str(q) for q in qargs)
-                        gate_error[gate_name][qargs_key] = err
-
-    return {
-        "name": backend.name,
-        "vendor": "ibm",
-        "type": "hardware",
-        "noise": True,
-        "num_qubits": target.num_qubits,
-        "coupling_map": coupling_map,
-        "basis_gates": list(target.operation_names),
-        "t1": t1 or None,
-        "t2": t2 or None,
-        "readout_error": readout_error or None,
-        "gate_error": gate_error or None,
-        "dt": target.dt,
-    }
-
-
-def make_backend_meta(backend: Any, **extras: Any) -> dict[str, Any]:
-    """
-    Build backend dict for any supported backend.
-
-    Supports AerSimulator (qiskit_aer) and IBMBackend
-    (qiskit_ibm_runtime). Imports are lazy so neither
-    package is a hard dependency of metautil.
-
-    Args:
-        backend: A backend instance (AerSimulator or IBMBackend)
-        **extras: Additional backend-specific fields to include
-
-    Returns:
-        Backend dict ready for write_backend
-
-    Raises:
-        TypeError: If backend type is not supported
-    """
-    # Try AerSimulator
-    try:
-        from qiskit_aer import AerSimulator
-        if isinstance(backend, AerSimulator):
-            info = _make_ibm_backend_meta(backend)
-            info["captured_at"] = datetime.now(timezone.utc).isoformat()
-            info.update(extras)
-            return info
-    except ImportError:
-        pass
-
-    # Try IBM Runtime backend
-    try:
-        from qiskit_ibm_runtime import IBMBackend
-        if isinstance(backend, IBMBackend):
-            info = _make_ibm_runtime_backend_meta(backend)
-            info["captured_at"] = datetime.now(timezone.utc).isoformat()
-            info.update(extras)
-            return info
-    except ImportError:
-        pass
-
-    raise TypeError(
-        f"Unsupported backend type: {type(backend).__name__}. "
-        f"Install qiskit_aer or qiskit_ibm_runtime."
-    )
 
 
 # ---------------------------------------------------------------------------

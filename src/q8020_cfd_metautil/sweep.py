@@ -1,53 +1,13 @@
-"""
-Parameter sweep orchestration for quantum experiments.
+"""Parameter sweep orchestration for quantum experiments.
 
-This module provides a generic framework for running parameter sweeps across quantum
-algorithms. It reads TOML configuration files, expands parameter combinations, executes
-scripts for each case, and organizes results in a structured directory hierarchy.
+Reads a TOML config, expands parameter combinations into cases, runs a
+script per case with full metadata capture, and organizes results in a
+dated workflow directory.  Supports local, parallel, and SLURM execution,
+plus multi-stage sweeps.  See the README for the TOML format, directory
+layout, and CLI usage.
 
-Function Categories:
-    Configuration Management:
-        - load_sweep_config: Parse TOML files with global params and experiment groups
-        - expand_case_lists: Expand list-valued parameters into individual cases
-        - build_command_args: Convert parameter dicts to command-line arguments
-
-    Execution:
-        - run_sweep: Main orchestrator - execute full parameter sweep
-        - run_single: Execute a single case with full metadata capture
-        - run_postproc: Execute postprocessing scripts on sweep results
-
-Directory Structure:
-    _<workflow_id>/
-        q8020_sweep_meta<workflow_id>.json   # Overall sweep metadata with start/end times
-        q8020_expanded_cases.json       # All parameter combinations
-        q8020_<config>.toml             # Copy of input TOML
-        <experiment_id>/
-            q8020_params_<exp_id>.json    # Case parameters with IDs
-            q8020_stdout_<exp_id>.txt     # Script stdout
-            q8020_stderr_<exp_id>.txt     # Script stderr
-            q8020_metadata_<exp_id>.json  # Unified metadata (harvested)
-            q8020_experiment_<exp_id>_0.json  # Metadata fragments
-            q8020_case_<exp_id>_0.json
-            q8020_code_<exp_id>_0.json
-            q8020_exec_stats_<exp_id>_0.json
-            q8020_artifacts_<exp_id>_0.json
-            *.png, *.pdf                # Generated visualizations
-
-TOML Configuration Format:
-    [global]
-    _output_dir = "./results"
-    _script = "src/my_algorithm.py"
-
-    [h2_sweep]
-    molecule = "H2"
-    shots = [1000, 2000, 4000]
-    _group_postproc = ["python analyze.py"]
-
-Usage:
-    q8020-sweeper config.toml
-    q8020-sweeper config.toml --script src/algo.py
-    q8020-sweeper config.toml --dry-run
-    q8020-sweeper config.toml --group h2_sweep
+Key entry points: load_sweep_config, expand_case_lists, run_sweep,
+run_single, run_postproc.
 """
 
 #pylint: disable=broad-exception-caught
@@ -60,14 +20,17 @@ import subprocess
 import sys
 import tarfile
 import time
-
-import subprocess_tee
 from datetime import datetime, timezone
 from itertools import product
 from pathlib import Path
 from typing import Any
 
+import argparse
+import json as _json
+
 import tomllib
+
+import subprocess_tee
 
 from q8020_cfd_metautil.harvest import harvest_metadata
 from q8020_cfd_metautil.meta_fragment import (
@@ -258,18 +221,7 @@ def _capture_dir_listing(dir_path: Path) -> dict[str, Any]:
 
 
 def capture_lib_snapshot(lib_path: str | Path) -> dict[str, Any]:
-    """
-    Capture environment snapshot for a library path.
-    
-    If the path looks like a venv, captures pip freeze output.
-    Otherwise, captures a detailed file listing.
-    
-    Args:
-        lib_path: Path to library directory or venv
-        
-    Returns:
-        Dict with snapshot data
-    """
+    """Snapshot a library path: pip freeze if a venv, else a file listing."""
     path = Path(lib_path).expanduser().resolve()
     
     if _is_venv(path):
@@ -279,15 +231,7 @@ def capture_lib_snapshot(lib_path: str | Path) -> dict[str, Any]:
 
 
 def _inventory_artifacts(artifact_dir: Path) -> dict[str, Any]:
-    """
-    Scan directory and build artifact inventory.
-
-    Args:
-        artifact_dir: Directory to scan for artifacts
-
-    Returns:
-        Dict with directory path and list of file info dicts
-    """
+    """Scan *artifact_dir* and build a file inventory."""
     result: dict[str, Any] = {
         "_source": "sweep",
         "directory": str(artifact_dir.resolve()),
@@ -344,16 +288,9 @@ def _make_case_section(
     case_id: str | None = None,
     case_params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Build case metadata section.
-
-    Args:
-        command: The command that was executed
-        cwd: Current working directory
-        case_id: TOML case id (e.g., "h2_sweep_0"). If provided, used as name.
-        case_params: TOML parameters for this case. If provided, included in output.
-
-    Returns:
-        Case metadata dict
+    """Build the case metadata section.  With *case_params* (sweep mode)
+    it carries case_id and params; without, it parses args from *command*
+    (standalone mode).
     """
     script = command[1] if len(command) > 1 else None
 
@@ -381,20 +318,66 @@ def _make_case_section(
         }
 
 
+_PY_ENTRY_PATTERN = re.compile(r"(\S+\.py)\b")
+
+
+def _resolve_app_identity(
+    command: list[str],
+    case_params: dict[str, Any] | None,
+) -> tuple[str, str | None, str | None]:
+    """Resolve (interpreter, entry_point, algorithm) for the code section.
+
+    The bare ``command[0]``/``command[1]`` slots record the shell wrapper
+    (``bash -c "...python solver.py..."``), not the app.  Prefer the TOML
+    ``_script`` (carried through as a case param) and the ``--method`` token
+    so the code section names the app, not the shell.
+    """
+    interpreter = command[0] if command else "unknown"
+    entry_point = command[1] if len(command) > 1 else None
+    algorithm: str | None = None
+
+    if case_params:
+        script = case_params.get("_script")
+        method = case_params.get("--method") or case_params.get("method")
+        if isinstance(method, str):
+            algorithm = method
+        if isinstance(script, str) and script:
+            # e.g. "python ./pkg/src/burgers_solver.py" -> py file + interp.
+            toks = script.split()
+            interpreter = toks[0] if toks else interpreter
+            m = _PY_ENTRY_PATTERN.search(script)
+            if m:
+                entry_point = Path(m.group(1)).name
+
+    # Fallback: unwrap a "bash -c <cmd>" wrapper when no _script was given.
+    if entry_point in (None, "-c") and command:
+        joined = " ".join(command)
+        m = _PY_ENTRY_PATTERN.search(joined)
+        if m:
+            entry_point = Path(m.group(1)).name
+            interpreter = "python"
+
+    return interpreter, entry_point, algorithm
+
+
 def _make_code_section(
     command: list[str],
     env_before: dict[str, Any] | None = None,
     env_after: dict[str, Any] | None = None,
+    case_params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build code metadata section with optional library version snapshots."""
-    interpreter = command[0] if command else "unknown"
-    entry_point = command[1] if len(command) > 1 else None
+    interpreter, entry_point, algorithm = _resolve_app_identity(
+        command, case_params
+    )
 
     result: dict[str, Any] = {
         "_source": "sweep",
         "entry_point": entry_point,
         "interpreter": interpreter,
     }
+    if algorithm is not None:
+        result["algorithm"] = algorithm
     if env_before is not None:
         result["library_versions_before"] = env_before
     if env_after is not None:
@@ -406,8 +389,6 @@ def _make_code_section(
 # Multi-stage helpers
 # ---------------------------------------------------------------------------
 
-import re
-
 _STAGE_VAR_PATTERN = re.compile(r"\{\{stages\.(\w+)\.(\w+)\}\}")
 
 
@@ -415,20 +396,10 @@ def _parse_stages(
     data: dict[str, Any],
     outer_global: dict[str, Any],
 ) -> list[tuple[str, dict[str, Any], dict[str, Any]]] | None:
-    """Parse ``[stage.<name>]`` sections from raw TOML data.
-
-    If the TOML contains no ``stage`` key the function returns ``None``
-    (backward-compatible single-stage config).  Otherwise it returns an
-    ordered list of ``(stage_name, stage_global_params, stage_groups)``
-    tuples.  Each stage's parameters are merged with *outer_global* as
-    defaults (stage-level scalars override, groups override further).
-
-    Args:
-        data: Raw dict from ``tomllib.load()``.
-        outer_global: The ``[global]`` section parameters.
-
-    Returns:
-        Ordered list of stage tuples, or None if no stages defined.
+    """Parse ``[stage.<name>]`` sections into ordered
+    ``(name, stage_global, stage_groups)`` tuples, or None if the TOML has
+    no ``stage`` key.  Each stage merges *outer_global* as defaults
+    (stage scalars override, groups override further).
     """
     if "stage" not in data:
         return None
@@ -486,18 +457,9 @@ def _substitute_stage_vars(
     params: dict[str, Any],
     stage_context: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
-    """Return a new dict with ``{{stages.<name>.<prop>}}`` placeholders resolved.
-
-    Only string values (and strings inside lists) are scanned for
-    placeholders.  All other value types are passed through unchanged.
-
-    Args:
-        params: Parameter dict (not mutated).
-        stage_context: Mapping of completed stage names to their
-            context dicts (e.g. ``{"run_dir": "/path", ...}``).
-
-    Raises:
-        ValueError: If a placeholder references an unknown stage or property.
+    """Resolve ``{{stages.<name>.<prop>}}`` placeholders in *params* (not
+    mutated) against *stage_context*.  Only strings (incl. those in lists)
+    are scanned.  Raises ValueError on an unknown stage or property.
     """
     def _replacer(m: re.Match) -> str:
         sname, prop = m.group(1), m.group(2)
@@ -572,27 +534,10 @@ def run_single(
     artifact_dir: Path | None = None,
     env_path: str | None = None,
 ) -> dict[str, Any]:
-    """
-    Run a single command with full metadata capture.
-
-    This is the inner execution function called by run_sweep() for each case.
-    The caller creates the directory; this function assumes case_dir exists.
-
-    Args:
-        command: Command and arguments to run
-        case_dir: Directory for this case (must exist)
-        experiment_id: Unique experiment identifier
-        workflow_id: Workflow ID (required)
-        case_id: TOML case id (e.g., "h2_sweep_0"). Used in metadata.
-        case_params: TOML parameters for this case. Included in case metadata.
-        timeout: Optional timeout in seconds
-        artifact_dir: Directory where black box writes artifacts; defaults to
-                      case_dir if not specified
-        env_path: Path to environment/venv to snapshot before and after execution
-
-    Returns:
-        Result dict with command, case_id, experiment_id, status, returncode,
-        output_dir. On timeout/exception, status is "timeout" or "exception".
+    """Run one case command with full metadata capture (the inner function
+    run_sweep() calls per case).  *case_dir* must already exist; *env_path*
+    is snapshotted before and after.  Returns a result dict whose status is
+    "success", "timeout", or "exception".
     """
     # Default artifact_dir to case_dir if not specified
     if artifact_dir is None:
@@ -810,6 +755,7 @@ def run_single(
         command=command,
         env_before=env_before,
         env_after=env_after,
+        case_params=case_params,
     )
     write_code(
         case_dir, code_section,
@@ -1034,6 +980,7 @@ def run_case_pipeline(
         command=cmd,
         env_before=env_before,
         env_after=env_after,
+        case_params=case_params,
     )
     write_code(
         case_dir, code_section,
@@ -1533,15 +1480,9 @@ def _generate_sbatch_script(
     dependency_job_id: str | None = None,
     packed_venvs: dict[str, Path] | None = None,
 ) -> str:
-    """Generate a single sbatch script that runs all cases in parallel.
-
-    Args:
-        dependency_job_id: If provided, adds ``#SBATCH --dependency=afterok:<id>``
-            so this job waits for the specified job to complete successfully.
-        packed_venvs: Mapping of resolved venv path -> tarball Path,
-            from ``_pack_venvs``.
-
-    Returns the sbatch script content as a string.
+    """Generate one sbatch script running all cases in parallel, returned
+    as a string.  *dependency_job_id* adds ``--dependency=afterok:<id>``;
+    *packed_venvs* maps resolved venv path -> tarball (from ``_pack_venvs``).
     """
     project = global_params.get("_slurm_project", "<PROJECT_ID>")
     walltime = global_params.get("_slurm_walltime", "02:00:00")
@@ -1801,11 +1742,10 @@ def _poll_slurm_job(
 
         # Try to read per-case results from pipeline_result.json
         case_results_found = 0
-        for eid, info in all_results.items():
+        for _, info in all_results.items():
             case_dir = Path(info.get("output_dir", ""))
             result_file = case_dir / "pipeline_result.json"
             if result_file.exists():
-                import json as _json
                 with open(result_file, encoding="utf-8") as f:
                     case_result = _json.load(f)
                 info.update(case_result)
@@ -1861,16 +1801,9 @@ def _finalize_slurm(
     dry_run: bool = False,
     dependency_job_id: str | None = None,
 ) -> str | None:
-    """Generate one sbatch script for all collected cases.
-
-    Mutates all_results in place to update status.
-
-    Args:
-        dependency_job_id: If provided, the generated sbatch script will
-            include ``--dependency=afterok:<id>`` so it waits for that job.
-
-    Returns:
-        The SLURM job ID if successfully submitted, otherwise ``None``.
+    """Generate and submit one sbatch script for all collected cases,
+    mutating *all_results* in place to update status.  *dependency_job_id*
+    adds ``--dependency=afterok:<id>``.  Returns the SLURM job ID, or None.
     """
     # Auto-pack venvs for NVMe broadcast if requested
     packed_venvs = None
@@ -2123,14 +2056,9 @@ def _finalize_slurm_postproc(
     dep_type: str = "afterok",
     dry_run: bool = False,
 ) -> str | None:
-    """Submit the dependent post-proc job for a SLURM sweep.
-
-    Args:
-        compute_job_id: The SLURM job ID this post-proc job must wait for.
-        dep_type: Dependency type (``afterok`` or ``afterany``).
-
-    Returns:
-        The post-proc SLURM job ID if submitted, otherwise ``None``.
+    """Submit the dependent post-proc job for a SLURM sweep, waiting on
+    *compute_job_id* (*dep_type* ``afterok``/``afterany``).  Returns the
+    post-proc job ID, or None on dry-run/failure.
     """
     sbatch_content = _generate_postproc_sbatch(
         run_dir, global_params, compute_job_id, dep_type,
@@ -2184,25 +2112,10 @@ def _finalize_slurm_postproc(
 # ---------------------------------------------------------------------------
 
 def expand_case_lists(case_id: str, case_params: dict) -> list:
-    """
-    Expand a case with list-valued parameters into multiple subcases.
-
-    For example, if a case has:
-        shots = [100, 1000, 10000]
-        ancilla = 6
-
-    This will expand into 3 subcases:
-        case_id_0: shots=100, ancilla=6
-        case_id_1: shots=1000, ancilla=6
-        case_id_2: shots=10000, ancilla=6
-
-    If ``_trials`` is set (integer > 1), each expanded case is replicated
-    that many times.  Trial cases are nested under their parent case
-    directory via ``_parent_case_id`` and ``_trial_index`` metadata keys
-    (both underscore-prefixed so they are never passed to the solver).
-
-    Returns:
-        List of (expanded_case_id, expanded_params) tuples
+    """Expand list-valued params into ``(case_id_N, params)`` subcases (one
+    per combination).  E.g. ``shots=[100,1000]`` -> two cases.  ``_trials>1``
+    replicates each case, nested via ``_parent_case_id``/``_trial_index``
+    (underscore keys, never passed to the solver).
     """
     # Extract _trials before processing (meta-key, not a solver param)
     trials = int(case_params.pop("_trials", 1))
@@ -2248,39 +2161,16 @@ def expand_case_lists(case_id: str, case_params: dict) -> list:
 
 
 def load_sweep_config(toml_path: str) -> dict:
+    """Load a sweep TOML into ``{'global', 'groups'}`` (or ``'stages'`` for
+    multi-stage).  Each non-global section is a group; list-valued params
+    are expanded per group.  Underscore meta-keys inherit global -> group,
+    group overriding.  See the README for the full TOML format.
     """
-    Load sweep configuration from a TOML file.
-    
-    Expected structure:
-        [global]  # or [_global]
-        _output_dir = "./results"
-        _script = "python src/solver.py"  # full command, can include venv activation
-        _inject_outdir = "outdir"
-        _case_preproc = ["python setup_case.py"]
-        _case_postproc = ["python harvester.py"]
-        _group_postproc = ["python group_postproc.py"]
-        _final_postproc = ["python final_postproc.py"]
-        
-        [case1]
-        molecule = "H2"
-        shots = [1000, 2000, 4000]
-        
-        [case2]
-        molecule = "LiH"
-        shots = 8192
-        _group_postproc = ["python custom_postproc.py"]  # overrides global
-    
-    Meta-keys (underscore-prefixed) are inherited from global to groups.
-    Group-level meta-keys override global ones.
-    
-    Returns:
-        dict with 'global' config and 'groups' (original cases with their expansions)
-    """
-    toml_path = Path(toml_path)
-    if not toml_path.is_file():
-        raise FileNotFoundError(f"TOML file not found: {toml_path}")
+    path = Path(toml_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"TOML file not found: {path}")
 
-    with open(toml_path, "rb") as f:
+    with open(path, "rb") as f:
         data = tomllib.load(f)
 
     # Support both "global" and "_global" as section names
@@ -2319,19 +2209,13 @@ def load_sweep_config(toml_path: str) -> dict:
     return {"global": global_params, "groups": groups}
 
 
-def build_command_args(params: dict, arg_mapping: dict = None) -> list:
-    """
-    Convert parameter dict to command-line arguments.
-    
-    Args:
-        params: Parameter dict from TOML
-        arg_mapping: Optional dict mapping param names to CLI arg names
-                     e.g., {"bond_length": "--bond-length"}
-                     If None, uses --{param_name} with hyphens (argparse convention)
-                     Keys starting with "-" are used as-is (e.g., "-nelem" -> -nelem)
-    
-    Returns:
-        List of command-line arguments
+def build_command_args(
+    params: dict, arg_mapping: dict | None = None
+) -> list:
+    """Convert a param dict to CLI args.  Names map via *arg_mapping* if
+    given, else become ``--key-name`` (underscores to hyphens); keys already
+    starting with "-" are used as-is.  Bools are flags; lists expand to
+    repeated values; ``_``-prefixed keys are skipped.
     """
     args = []
     skip_keys = {"executable", "_output_dir", "_case_preproc", "_case_postproc", "_group_postproc", "_final_postproc", "_inject_outdir", "_inject_experiment_id", "_inject_workflow_id", "_env"}
@@ -2370,26 +2254,15 @@ def build_command_args(params: dict, arg_mapping: dict = None) -> list:
 def run_postproc(
     postproc_list: list,
     postproc_json: Path,
-    script_dir: Path = None,
+    script_dir: Path | None = None,
     dry_run: bool = False,
-    case_dir: Path = None,
+    case_dir: Path | None = None,
     proc_type: str = "postproc",
-    experiment_id: str = None,
+    experiment_id: str | None = None,
 ) -> list:
-    """
-    Run pre/postprocessing scripts with a JSON file as the single argument.
-    
-    Args:
-        postproc_list: List of postproc commands (e.g., ["python analyze.py", "python plot.py --verbose"])
-        postproc_json: Path to JSON file containing postproc context
-        script_dir: Directory containing the script (added to PYTHONPATH for module imports)
-        dry_run: If True, print commands without executing
-        case_dir: Directory to write stdout/stderr files (optional)
-        proc_type: "preproc" or "postproc" for file naming
-        experiment_id: Experiment ID for file naming
-    
-    Returns:
-        List of results for each postproc command
+    """Run each pre/postproc command in *postproc_list*, passing
+    *postproc_json* as the single argument.  *script_dir* is added to
+    PYTHONPATH.  Returns a result per command.
     """
     results = []
     
@@ -2463,10 +2336,10 @@ def run_postproc(
 
 def run_sweep(
     toml_path: str,
-    script: str,
-    arg_mapping: dict = None,
+    script: str | None,
+    arg_mapping: dict | None = None,
     dry_run: bool = False,
-    group_filter: list = None,
+    group_filter: list | None = None,
     overrides: dict[str, str] | None = None,
     *,
     _preloaded_config: dict | None = None,
@@ -2474,15 +2347,10 @@ def run_sweep(
     _run_dir_override: Path | None = None,
     _workflow_id_override: str | None = None,
 ) -> dict:
-    """Run a parameter sweep from a TOML configuration file.
-
-    Args:
-        overrides: CLI --set overrides applied to [global].
-        _preloaded_config: If provided, skip TOML loading and use this config
-            directly.  Used internally by the multi-stage orchestrator.
-        _dependency_job_id: SLURM job ID that this sweep must wait for.
-        _run_dir_override: Use this run directory instead of generating one.
-        _workflow_id_override: Use this workflow ID instead of generating one.
+    """Run a parameter sweep from a TOML config.  *overrides* are CLI
+    ``--set`` values applied to [global].  The ``_``-prefixed keyword args
+    are internal hooks used by the multi-stage orchestrator (preloaded
+    config, SLURM dependency, run-dir/workflow-id overrides).
     """
     config = _preloaded_config or load_sweep_config(toml_path)
     global_params = config["global"]
@@ -2691,6 +2559,11 @@ def run_sweep(
             group_executable = group_script
         else:
             group_executable = executable
+        if not group_executable:
+            raise ValueError(
+                f"Group '{group_id}' has no executable: set a global "
+                "_script or a per-group _script."
+            )
 
         # If _env is set, prepend venv activation
         env_path = group_params.get("_env")
@@ -3218,23 +3091,10 @@ def _run_multi_stage_sweep(
 ) -> dict[str, Any]:
     """Run a multi-stage sweep where each stage executes after the previous.
 
-    For SLURM jobs, stages are chained via ``--dependency=afterok:<id>``.
-    For local execution, stages run sequentially in-process.
-
-    A non-SLURM stage following a SLURM stage raises ``ValueError``
-    because the local process cannot block on a queued SLURM job.
-
-    Args:
-        toml_path: Path to TOML config (for metadata only).
-        outer_global: The top-level ``[global]`` parameters.
-        stages: Ordered list of ``(name, stage_global, stage_groups)``.
-        script: CLI-provided script override (may be None).
-        dry_run: If True, print commands without executing.
-        group_filter: Optional group name filter (applied within each stage).
-        overrides: CLI ``--set`` overrides.
-
-    Returns:
-        Combined results dict with per-stage sub-results.
+    SLURM stages chain via ``--dependency=afterok:<id>``; local stages run
+    sequentially in-process.  A non-SLURM stage after a SLURM stage raises
+    ``ValueError`` (the local process cannot block on a queued job).
+    Returns a combined results dict with per-stage sub-results.
     """
     # Shared workflow ID and base run directory for all stages
     workflow_id = generate_workflow_id()
@@ -3355,7 +3215,6 @@ def _run_multi_stage_sweep(
 # CLI
 
 def main():
-    import argparse
 
     parser = argparse.ArgumentParser(
         description="Run parameter sweeps from TOML configuration",

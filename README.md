@@ -38,41 +38,71 @@ stays open to algorithm- and backend-specific data.
 Flattened keys follow the pattern `section.index.field`, e.g.
 `backend.0.name`, `results.0.fidelity`.
 
-For the full field-by-field schema specification, see
-[docs/experiment_metadata_schema.md](docs/experiment_metadata_schema.md).
-For LLM-based metadata review instructions, see
-[docs/llm-metadata-review.md](docs/llm-metadata-review.md).
+### Lifecycle
+
+Metadata moves through four stages; each writes files, none overwrites a
+prior stage's:
+
+1. **Capture** -- fragments `q8020_<section>_N.json` are written, either
+   by the solver itself (open box) or by an orchestrator/harvester around
+   it (closed box).
+2. **Assemble** -- `q8020-harvest` rolls all fragments in a case dir up
+   into one `q8020_metadata_<id>.json`.
+3. **Analyze** -- `metakeys` (and other WIP tools) report key coverage
+   across many assembled cases for search and comparison.
+4. **Groom** -- later fixes (reviews, alignments, closed-box gap-fills)
+   are added as **metapatches**, never edits: dated `metapatches/<date>/`
+   deltas that a consumer composes over the base at read time.
+
+The scheme is deliberately loose: cases, codes, and backends vary, and
+records may come from closed boxes or older tool versions.  Required
+fields are few; `**extras` keeps every section open.  "Record the raw
+tracks, fix it in the mix."
+
+See also: [docs/experiment_metadata_schema.md](docs/experiment_metadata_schema.md)
+(full field-by-field schema),
+[docs/llm-metadata-review.md](docs/llm-metadata-review.md) (LLM-based
+review), and [docs/metapatches.md](docs/metapatches.md) (write-once
+grooming).
 
 ## Two instrumentation models
 
 ### Open box -- direct instrumentation
 
 When you control the solver source, call metautil helpers directly to
-capture rich metadata from live objects:
+capture metadata from live objects:
 
 ```python
 from q8020_cfd_metautil.meta_fragment import (
-    make_backend_meta,
     make_code_meta,
     write_backend,
-    write_results,
+    write_code,
+    write_artifacts,
 )
-
-# Pass a Qiskit backend object; extracts noise model, gate errors,
-# coupling map, T1/T2, qubit count automatically.
-backend_dict = make_backend_meta(backend, shots=1024)
-write_backend(case_dir, backend_dict)
-
-# Pass a transpiled circuit; extracts gate counts, depth, width.
-write_artifacts(case_dir, {"transpile_passes": transpile_info})
 
 # Algorithm and environment captured together.
 code_dict = make_code_meta("hhl", __file__, run_args=vars(args))
+write_code(case_dir, code_dict)
+
+# Circuit / transpile details ride along as free-form extras.
+write_artifacts(case_dir, {"transpile_passes": transpile_info})
 ```
 
-`make_backend_meta` auto-detects AerSimulator and IBMBackend via lazy
-imports -- no hard dependency on either.  The `**extras` catch-all on
-every builder lets algorithm-specific fields ride along.
+metautil is a **pure core**: it defines the `BackendMeta` shape (see
+`meta_fragment.BackendMeta`) and reads/writes it, but does not extract it
+from any vendor's backend object -- that keeps Qiskit and friends out of
+the core's dependencies.  Vendor extraction lives in a sibling package:
+
+```python
+# One-line import for the IBM extractor; no Qiskit dep in metautil itself.
+from q8020_backend_utils.ibm.backend_meta import make_backend_meta
+
+backend_dict = make_backend_meta(backend, shots=1024)  # T1/T2, gate/
+write_backend(case_dir, backend_dict)                  # readout error, etc.
+```
+
+The `**extras` catch-all on every builder lets algorithm- and
+backend-specific fields ride along.
 
 ### Closed box -- harvest from outputs
 
@@ -370,28 +400,59 @@ When `_trials > 1`, trial directories are nested:
     ...
 ```
 
+## Solver framework (solverfw)
+
+Many CFD codes in this study repeat the same scaffolding -- a time-march
+loop, a spatial discretization, a linear solve, state I/O.  `solverfw`
+factors that out as small abstract bases so an application focuses on its
+algorithm, not the plumbing.  It has no metadata dependency; capture is
+layered on via the `PostProcessor` observer hook.
+
+| Class | Role |
+|---|---|
+| `SolverConfig` | Base config for an application |
+| `Grid` / `Grid1D` | Computational grid (uniform 1-D provided) |
+| `State` / `DenseState` | Solution state representation |
+| `SpatialOperator` | Spatial discretization (abstract) |
+| `TimeIntegrator` / `ForwardEuler` | Time advancement |
+| `LinearSystemSolver` | `Ax=b` solve (`LU`, `GMRES`, `Null` provided) |
+| `MainLoop` | Time-marching driver tying the above together |
+| `PostProcessor` | Observer invoked per step (metadata, plots, checks) |
+
+```python
+from q8020_cfd_metautil.solverfw import (
+    SolverConfig, Grid1D, DenseState, ForwardEuler, MainLoop,
+)
+```
+
+An application supplies its own `SpatialOperator` (and optionally state,
+integrator, linear solver); `MainLoop` drives to completion and calls the
+`PostProcessor` each step, where per-step metrics land in the `analysis`
+section.  See [docs/SPEC-solverfw.md](docs/SPEC-solverfw.md).
+
 ## Analysis tools
 
-### q8020-metakeys
+### metakeys
 
-Report flattened metadata key coverage across cases.  Three output
-modes:
+Report flattened metadata key coverage across cases.  Run as a module
+(`python -m q8020_cfd_metautil.metakeys`; the `q8020-metakeys` console
+script is not currently installed).  Three output modes:
 
 ```bash
 # Full: every key with count and pct (JSON, default)
-q8020-metakeys sweep/
+python -m q8020_cfd_metautil.metakeys sweep/
 
 # Full: plain-text table
-q8020-metakeys sweep/ --table
+python -m q8020_cfd_metautil.metakeys sweep/ --table
 
 # Names: one full dotted key per line, sorted
-q8020-metakeys sweep/ --mode names
+python -m q8020_cfd_metautil.metakeys sweep/ --mode names
 
 # Combined: strip numeric indices, deduplicate
-q8020-metakeys sweep/ --mode combined
+python -m q8020_cfd_metautil.metakeys sweep/ --mode combined
 
 # Combined + JSON: canonical keys with grouped full-key detail
-q8020-metakeys sweep/ --mode combined --json
+python -m q8020_cfd_metautil.metakeys sweep/ --mode combined --json
 ```
 
 Filters: `--skip PAT` (repeatable), `--section SEC`, `--common`

@@ -17,7 +17,7 @@ The intent is simply to capture as much metadata as possible about a quantum com
 
 ## Capturing Metadata: Open & Closed Boxes
 
-There will be variability in what can be captured for many reasons. Open box codes can be heavily instrumented - we provide a Python library to make this convenient. For example, a method which takes an IBM backend and mines it for all its calibration and connection data, or one which does similar with a transpiled circuit, or one which takes a snapshot of all the versions of the libraries in scope for the run. 
+There will be variability in what can be captured for many reasons. Open box codes can be heavily instrumented - we provide Python libraries to make this convenient. For example, a method which takes an IBM backend and mines it for all its calibration and connection data (this vendor-specific extraction lives in the sibling `q8020-backend-utils`, keeping metautil itself free of a Qiskit dependency), or one which does similar with a transpiled circuit, or one which takes a snapshot of all the versions of the libraries in scope for the run. 
 
 Closed box codes are harder to gather from, but any discernable output is potentially queryable by a metadata "harvester" armed with even a minimal natural language knowledge of the expected output. The modern LLM tooling is a real benefit in this regard - in gathering data from parsed output files, in validating contents are complete as intended, in morphing between equivalent formats.
 
@@ -33,16 +33,28 @@ This repo contains reusable tools, provided as-is.
 - **args.py**: Boilerplate argparse groups for common quantum codes
   (e.g. backend, shots).
 
-- **meta_fragment.py**: Takes live objects (backends, circuits, etc.)
-  and produces metadata JSON fragments.
+- **meta_fragment.py**: Dict builders and fragment I/O. Defines the
+  section builders (`make_experiment_meta`, `make_case_meta`,
+  `make_code_meta`, ...) and the neutral `BackendMeta` contract. It is a
+  **pure core** -- it reads/writes fragments but does not extract backend
+  metadata from any vendor object; that lives in `q8020-backend-utils`.
 
 - **harvest.py** (`q8020-harvest`): Rolls up fragments for an
   experiment (i.e. specific {case, code, backend}). Fragments may
   appear multiple times in the same experiment.
 
-- **metakeys.py** (`q8020-metakeys`): Find metadata keys in an
-  experiment or common across experiments; flatten the name tree or be
-  verbose. Necessary for search and comparison.
+- **metakeys.py**: Find metadata keys in an experiment or common across
+  experiments; flatten the name tree or be verbose. For search and
+  comparison. (Run as `python -m q8020_cfd_metautil.metakeys`; the
+  `q8020-metakeys` console script is not currently installed.)
+
+- **compare.py**: Cross-case metadata comparison. (Module-level;
+  console script not currently installed.)
+
+- **metapatches** ([metapatches.md](metapatches.md)): Additive,
+  write-once grooming of already-harvested metadata -- dated
+  `metapatches/<date>/` deltas a consumer composes over the base at read
+  time. Never edits originals.
 
 - **sweep.py** (`q8020-sweep`): Takes a TOML config describing the
   experiment and runs it, sweeping parameters where specified.
@@ -58,7 +70,7 @@ This repo contains reusable tools, provided as-is.
 
 Besides this one, the "q8020-cfd-axequalsb" repo contains some open box codes used in the CFD study - this is a growing set, and does not include closed box codes stored elsewhere. 
 
-"q8020-cfd-experiments" is where we are storing the harvested experiment metadata for the CFD project. "q8020-cfd-docs" describes the project. "q8020-cfd-qutil" is a small collection of convenience utilities (e.g. to remove "q8020-cfd-metadata" from having dependency on Qiskit, functions to poll IBM backends are here). 
+"q8020-cfd-experiments" is where we are storing the harvested experiment metadata for the CFD project. "q8020-cfd-docs" describes the project. "q8020-cfd-qutil" is a small collection of convenience utilities (e.g. functions to poll IBM backends). "q8020-backend-utils" holds the vendor-specific backend extraction (e.g. `q8020_backend_utils.ibm.backend_meta.make_backend_meta`) that produces the `BackendMeta` shape -- kept out of "q8020-cfd-metautil" so the metadata core has no dependency on Qiskit. 
 
 
 # MACHINE-GENERATED DOC
@@ -257,6 +269,8 @@ Each field carries a `_source` tag indicating provenance:
 - `"solver"`: Emitted by the algorithm script
 - `"sweep"`: Added by the experiment harness
 - `"stdout"`: Parsed from script output
+- `"harvest"`: Reconstructed by a closed-box harvester
+- `"review"`: Supplied by a later metapatch grooming pass (see below)
 
 This enables tracing where each piece of data originated.
 

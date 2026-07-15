@@ -29,18 +29,25 @@ Every experiment should capture data in these high-level categories. The reviewe
 
 ### Step 1: Inventory the Directory
 
-List all files in the case directory. Files may have varying names depending on case/code/backend, but look for patterns:
-- JSON files containing metadata, results, analysis
-- Text files containing stdout/stderr
-- Any other artifacts (plots, circuit diagrams, etc.)
+List all files in the case directory. The conventional layout is:
+- **Fragments**: `q8020_<section>_N.json` (or `q8020_sweep_<section>_<id>_N.json`)
+  -- one per section, `N` a zero-based index. These are the raw inputs.
+- **Rollup**: `q8020_metadata_<id>.json` -- the assembled record.
+- **Metapatches**: `metapatches/<date>/q8020_patch_<section>_N.json` --
+  additive grooming deltas layered over the rollup (see below).
+- Text files: `q8020_stdout_*.txt`, `q8020_stderr_*.txt`.
+- Other artifacts: plots, circuit diagrams, TOML config, etc.
 
-Note: File naming conventions may vary. Focus on content, not exact filenames.
+Content still matters more than exact names -- closed-box harvests and
+older tool versions may deviate -- but the above is the norm.
 
 ### Step 2: Find the Rollup File
 
-Look for a composite metadata file (often named `q8020_metadata_*.json` or similar) that aggregates data from multiple sources. This is the primary file to review.
-
-If no rollup exists, review individual fragment files.
+Review `q8020_metadata_<id>.json`, the composite record produced by
+`q8020-harvest` (which rolls all fragments in the dir up into one file).
+If no rollup exists, either run `q8020-harvest` on the dir or review the
+individual fragment files directly. If a `metapatches/` dir is present,
+the fullest view is the base rollup composed with its active patches.
 
 ### Step 3: Assess Each Category
 
@@ -206,6 +213,24 @@ Produce a structured assessment:
 ## Reproducibility Assessment
 [Can this experiment be reproduced from the captured data? What's missing?]
 ```
+
+## Recording Fixes
+
+**Never edit the original metadata.** Fragments (`q8020_<section>_N.json`)
+and the assembled rollup (`q8020_metadata_<id>.json`) are write-once. When
+the review finds a value that is wrong, missing, or derivable from other
+captured data, record the correction as a **metapatch** -- an additive,
+dated delta -- not an edit:
+
+- Write `<case>/metapatches/<YYYYMMDD>/q8020_patch_<section>_N.json`
+  containing `{"_source": "review", "_patch_date": ..., "patches":
+  {"<section>": {<field>: <value>}}}`.
+- A consumer composes base + active patches at read time (deep-merge,
+  later-wins). Deprecate a patch by renaming it `.off`, never by deleting.
+
+See [metapatches.md](metapatches.md) for the full convention. The review's
+job is to produce the assessment above **and** the metapatch files for any
+fix it is confident in; leave uncertain items as flagged findings only.
 
 ## Special Cases
 
