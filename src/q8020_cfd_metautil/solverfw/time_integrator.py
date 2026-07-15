@@ -5,8 +5,6 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any
 
-import numpy as np
-
 if TYPE_CHECKING:
     from q8020_cfd_metautil.solverfw.config import SolverConfig
     from q8020_cfd_metautil.solverfw.grid import Grid
