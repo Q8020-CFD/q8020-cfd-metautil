@@ -68,14 +68,16 @@ def test_mpi_case_scales_nodes_by_tasks_per_node(tmp_path):
     assert "#SBATCH -N 2" in script
 
 
-def test_mpi_nodes_multiply_across_cases(tmp_path):
+def test_mpi_cases_run_sequentially_on_same_nodes(tmp_path):
+    # MPI cases execute one at a time (concurrent multi-rank steps race
+    # in PMI/shm init), so the job only needs nodes for ONE case.
     params = _base_params()
     params["_slurm_tasks_per_case"] = 16
     params["_slurm_tasks_per_node"] = 8
     script = _generate_sbatch_script(
         _cases_info(tmp_path, 3), params, tmp_path,
     )
-    assert "#SBATCH -N 6" in script
+    assert "#SBATCH -N 2" in script
 
 
 def test_mpi_node_count_rounds_up(tmp_path):
@@ -97,10 +99,11 @@ def test_mpi_worker_not_wrapped_in_srun(tmp_path):
     (worker,) = _worker_lines(script)
     assert "srun" not in worker
     assert worker.strip().startswith("python3 -m")
-    assert worker.rstrip().endswith("&")
 
 
-def test_mpi_worker_still_backgrounded_per_case(tmp_path):
+def test_mpi_workers_run_sequentially_not_backgrounded(tmp_path):
+    # No trailing `&`: each case's multi-rank step must fully finish
+    # before the next starts, so steps never contend during MPI init.
     params = _base_params()
     params["_slurm_tasks_per_case"] = 16
     script = _generate_sbatch_script(
@@ -108,4 +111,4 @@ def test_mpi_worker_still_backgrounded_per_case(tmp_path):
     )
     workers = _worker_lines(script)
     assert len(workers) == 2
-    assert all(w.rstrip().endswith("&") for w in workers)
+    assert all(not w.rstrip().endswith("&") for w in workers)

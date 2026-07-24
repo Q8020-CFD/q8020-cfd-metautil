@@ -1505,10 +1505,11 @@ def _generate_sbatch_script(
         global_params.get("_slurm_cores_per_node", 64)
     )
     if tasks_per_case > 1:
-        # Distributed (MPI) cases: each case spans
-        # ceil(tasks_per_case / tasks_per_node) whole nodes.
-        nodes_per_case = -(-tasks_per_case // mpi_tasks_per_node)
-        n_nodes = n_cases * nodes_per_case
+        # Distributed (MPI) cases run SEQUENTIALLY on one shared node
+        # pool sized for a single case: concurrent multi-rank job steps
+        # in one allocation race in Cray MPICH's PMI/shared-memory init
+        # ("MPIDU_Init_shm_init: unable to attach to shared memory").
+        n_nodes = -(-tasks_per_case // mpi_tasks_per_node)
     elif exclusive_node:
         n_nodes = n_cases  # 1 node per case
     else:
@@ -1523,9 +1524,11 @@ def _generate_sbatch_script(
             # `srun -n {tasks_per_case}` job step. Wrapping the worker
             # in a 1-task srun would make that inner srun hang waiting
             # for resources already held by the outer step.
+            # No trailing `&` either: cases run one after another so
+            # multi-rank steps never overlap during MPI init.
             worker = (
                 f"python3 -m q8020_cfd_metautil.sweep_worker "
-                f"{info['args_file']} &"
+                f"{info['args_file']}"
             )
         elif exclusive_node:
             worker = (
