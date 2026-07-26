@@ -36,7 +36,7 @@ class MitigationSpec:
     # Live in q8020-backend-utils:
     trex: bool = False
     dynamical_decoupling: bool = False
-    dd_sequence: str = "XpXm"
+    dd_sequence: str = "XY4"
     # Reserved -- named, not implemented anywhere yet:
     zne: bool = False
     pec: bool = False

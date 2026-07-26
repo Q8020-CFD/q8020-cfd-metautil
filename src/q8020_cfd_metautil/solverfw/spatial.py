@@ -31,23 +31,13 @@ class SpatialOperator(ABC):
         state: State,
         grid: Grid,
         cfl: float,
-    ) -> float:
-        """CFL-based time-step estimate.
-
-        Default: dt = cfl * dx (fine for scalar advection / Burgers).
-        Override for multi-variable systems with wave speeds.
-        """
+        *,
+        local: bool = False,
+    ) -> float | tuple[float, np.ndarray | None]:
+        """CFL-based time-step. local=False returns a float (dt); local=True
+        returns (dt_min, dt_per_cell | None). Default is scalar dt = cfl*dx
+        (fine for scalar advection / Burgers). Override for systems with
+        wave speeds and/or per-cell local time-stepping."""
+        if local:
+            return cfl * grid.dx, None
         return cfl * grid.dx
-
-    def compute_local_timestep(
-        self,
-        state: State,
-        grid: Grid,
-        cfl: float,
-    ) -> tuple[float, np.ndarray | None]:
-        """Per-cell time-step for local time-stepping integrators (v2).
-
-        Returns (dt_min, dt_per_cell). Default derives from the scalar
-        compute_timestep with no per-cell array; override to supply one.
-        """
-        return self.compute_timestep(state, grid, cfl), None

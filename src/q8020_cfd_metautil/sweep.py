@@ -2111,6 +2111,92 @@ def _finalize_slurm_postproc(
 # Sweep configuration and execution
 # ---------------------------------------------------------------------------
 
+# Registered slot names, mirrored from solverfw.registry.SLOTS to keep the
+# common (registry-free) sweep path import-light: detection consults this
+# tuple, and the registry itself is imported lazily only when a case
+# actually expresses a plugin chain.
+_REGISTRY_SLOTS = (
+    "grid",
+    "transform",
+    "spatial",
+    "solve",
+    "encode",
+    "backend",
+    "readout",
+    "linsolve",
+    "convergence",
+    "validate",
+)
+
+# Sweep-wide accumulator of cells the registry pruning pass dropped. Each
+# entry is {"case_id", "violations", "chain"}. expand_case_lists appends
+# here; the sweep can read it into provenance.pruned_conflicts (SPEC v2 §7,
+# §2a.1-B). Least-invasive choice: expand_case_lists keeps its existing
+# (list of (id, params)) return shape, so both call sites are untouched.
+PRUNED_CONFLICTS: list[dict[str, Any]] = []
+
+
+def reset_pruned_conflicts() -> None:
+    """Clear the sweep-wide pruned-cell accumulator (call at sweep start)."""
+    PRUNED_CONFLICTS.clear()
+
+
+def _case_chain(params: dict) -> dict[str, dict[str, Any]] | None:
+    """Build a registry chain ``{slot: {"plugin", "knobs"}}`` from *params*
+    if it uses the v2 slot vocabulary, else ``None``.
+
+    Recognized forms (any one triggers chain-building for the case):
+      - a nested ``chain`` dict already in ``{slot: {...}}`` shape;
+      - a dotted ``<slot>.plugin`` / ``<slot>.knobs.<knob>`` key.
+    Once triggered, bare ``<slot>`` string keys (e.g. ``backend``) are also
+    folded in. A case with none of these is left untouched -- the critical
+    invariant that registry-free sweeps expand byte-identically to before.
+
+    Note: sees only the (expanded) case params, not the ``[global]`` block;
+    a chain split across global + case is checked on its case portion only
+    (acceptable for 2a scope).
+    """
+    chain: dict[str, dict[str, Any]] = {}
+    triggered = False
+
+    nested = params.get("chain")
+    if isinstance(nested, dict):
+        triggered = True
+        for slot, fill in nested.items():
+            if slot not in _REGISTRY_SLOTS or not isinstance(fill, dict):
+                continue
+            entry = chain.setdefault(slot, {"knobs": {}})
+            if "plugin" in fill:
+                entry["plugin"] = fill["plugin"]
+            if isinstance(fill.get("knobs"), dict):
+                entry["knobs"].update(fill["knobs"])
+
+    for key, value in params.items():
+        if key == "chain" or "." not in key:
+            continue
+        slot, rest = key.split(".", 1)
+        if slot not in _REGISTRY_SLOTS:
+            continue
+        triggered = True
+        entry = chain.setdefault(slot, {"knobs": {}})
+        if rest == "plugin":
+            entry["plugin"] = value
+        elif rest.startswith("knobs."):
+            entry["knobs"][rest[len("knobs."):]] = value
+
+    if not triggered:
+        return None
+
+    # Fold bare slot-name string keys (e.g. backend = "classical") now that
+    # the case is known to use the v2 vocabulary.
+    for slot in _REGISTRY_SLOTS:
+        value = params.get(slot)
+        if isinstance(value, str):
+            chain.setdefault(slot, {"knobs": {}})["plugin"] = value
+
+    return chain
+
+
 def expand_case_lists(case_id: str, case_params: dict) -> list:
     """Expand list-valued params into ``(case_id_N, params)`` subcases (one
     per combination).  E.g. ``shots=[100,1000]`` -> two cases.  ``_trials>1``
@@ -2157,7 +2243,60 @@ def expand_case_lists(case_id: str, case_params: dict) -> list:
                 replicated.append((trial_id, trial_params))
         expanded_cases = replicated
 
+    # Opt-in registry pruning pass (SPEC v2 §5, §2a.1-B). No-op unless a case
+    # expresses a registered-slot chain, so registry-free sweeps are byte-
+    # identical to before. Violating cells are dropped, logged, and recorded
+    # in PRUNED_CONFLICTS for provenance.pruned_conflicts.
+    expanded_cases = _prune_expanded_cases(expanded_cases)
+
     return expanded_cases
+
+
+def _prune_expanded_cases(expanded_cases: list) -> list:
+    """Drop registry-violating cells from *expanded_cases* (opt-in / no-op).
+
+    Cases whose params express no registered-slot chain pass through
+    untouched. For cases that do, the registry (imported lazily so the
+    common path stays load-light) checks the chain; violating cells are
+    dropped, logged, and appended to ``PRUNED_CONFLICTS``.
+    """
+    kept: list = []
+    registry = None  # imported lazily on first real chain
+
+    for eid, eparams in expanded_cases:
+        chain = _case_chain(eparams)
+        if chain is None:
+            kept.append((eid, eparams))
+            continue
+
+        if registry is None:
+            # Import + populate only when a chain is actually seen.
+            from q8020_cfd_metautil.solverfw import (  # noqa: PLC0415
+                REGISTRY,
+            )
+            from q8020_cfd_metautil.solverfw import (  # noqa: PLC0415
+                plugins_euler,
+            )
+            plugins_euler.register_all()
+            registry = REGISTRY
+
+        violations = registry.check_cell(chain)
+        if violations:
+            record = {
+                "case_id": eid,
+                "violations": violations,
+                "chain": chain,
+            }
+            PRUNED_CONFLICTS.append(record)
+            print(
+                f"{YELLOW}{BOLD}Pruned case{RESET} {eid}: "
+                f"{'; '.join(violations)}",
+                file=sys.stderr,
+            )
+            continue
+        kept.append((eid, eparams))
+
+    return kept
 
 
 def load_sweep_config(toml_path: str) -> dict:

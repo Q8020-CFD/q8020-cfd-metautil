@@ -21,6 +21,7 @@ class SolveContext:
     step: int = 0
     inner_iter: int = 0
     nelem: int | None = None
+    x0: np.ndarray | None = None
 
 
 class LinearSystemSolver(ABC):
@@ -44,6 +45,10 @@ class LUSolver(LinearSystemSolver):
         # actually used, keeping solverfw startup lean. scipy is a declared
         # dependency, so it is available when needed.
         import scipy.linalg
+        # General dense solve. The original Euler solver attempted
+        # assume_a='banded' but always fell back to a general dense solve for
+        # its dense FD Jacobian, so a general solve is numerically equivalent
+        # to the original (2a.1-C item 4: deliberate non-change).
         x = scipy.linalg.solve(A, b)
         return x, {}
 
@@ -57,7 +62,14 @@ class GMRESSolver(LinearSystemSolver):
     def solve(self, A, b, ctx=None):
         # Lazy import: see LUSolver.solve -- scipy is optional.
         import scipy.sparse.linalg as spla
-        x, info = spla.gmres(A, b, rtol=self.tol)
+        # Warm-start from ctx.x0 when supplied (Euler threads qold here to
+        # reproduce the original's x0=qold behaviour). rtol/tol kwarg name
+        # varies across scipy versions -- mirror the original robustness.
+        x0 = ctx.x0 if ctx is not None and ctx.x0 is not None else None
+        try:
+            x, info = spla.gmres(A, b, x0=x0, rtol=self.tol)
+        except TypeError:
+            x, info = spla.gmres(A, b, x0=x0, tol=self.tol)
         return x, {"gmres_info": int(info)}
 
 

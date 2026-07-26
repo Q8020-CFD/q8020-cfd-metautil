@@ -27,6 +27,7 @@ from q8020_cfd_metautil.solverfw.convergence import (
     ResidualRatio,
     ResidualVsInitial,
 )
+from q8020_cfd_metautil.solverfw.encode import EncodeResult, Encoder
 from q8020_cfd_metautil.solverfw.grid import Grid, Grid1D
 from q8020_cfd_metautil.solverfw.state import DenseState, State
 from q8020_cfd_metautil.solverfw.spatial import SpatialOperator
@@ -46,6 +47,7 @@ from q8020_cfd_metautil.solverfw.postprocess import (
     PostProcessor,
 )
 from q8020_cfd_metautil.solverfw.problem_type import ProblemType
+from q8020_cfd_metautil.solverfw.readout import Readout, ReadoutContext
 from q8020_cfd_metautil.solverfw.registry import (
     REGISTRY,
     ForeignInfo,
@@ -65,6 +67,8 @@ __all__ = [
     "ClassicalTarget",
     "ConvergencePredicate",
     "DenseState",
+    "EncodeResult",
+    "Encoder",
     "ForeignInfo",
     "ForwardEuler",
     "GMRESSolver",
@@ -83,6 +87,8 @@ __all__ = [
     "ProblemType",
     "QiskitBackend",
     "REGISTRY",
+    "Readout",
+    "ReadoutContext",
     "Registry",
     "ResidualRatio",
     "ResidualVsInitial",
