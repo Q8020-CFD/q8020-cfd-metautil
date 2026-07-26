@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from q8020_cfd_metautil.solverfw.problem_type import ProblemType
+
 
 @dataclass
 class SolverConfig(ABC):
@@ -33,6 +35,10 @@ class SolverConfig(ABC):
 
     # --- extensible metadata ---
     extra: dict[str, Any] = field(default_factory=dict)
+
+    # --- problem taxonomy (v2; appended last to preserve positional
+    #     field order for existing subclasses) ---
+    problem_type: ProblemType = ProblemType.IVP
 
     # Hook for derived setup (e.g. computing inlet primitives).
     def setup(self) -> None:

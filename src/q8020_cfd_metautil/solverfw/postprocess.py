@@ -28,8 +28,16 @@ class PostProcessor(ABC):
         self,
         config: SolverConfig,
         elapsed_s: float,
+        solutions: list | None = None,
+        grid: Any = None,
     ) -> None:
-        """Called once after the loop finishes."""
+        """Called once after the loop finishes.
+
+        v2 widens the hook: MainLoop passes the accumulated solutions
+        and the grid so terminal I/O has the final state. v1 two-arg
+        implementations keep working -- MainLoop falls back to the
+        two-arg call on TypeError.
+        """
 
 
 class NullPostProcessor(PostProcessor):
@@ -38,5 +46,5 @@ class NullPostProcessor(PostProcessor):
     def on_step(self, step, t, state, metrics):
         pass
 
-    def finalize(self, config, elapsed_s):
+    def finalize(self, config, elapsed_s, solutions=None, grid=None):
         pass

@@ -27,6 +27,22 @@ class TimeIntegrator(ABC):
     ) -> tuple[State, dict[str, Any]]:
         """Return (new_state, step_metrics)."""
 
+    def compute_dt(
+        self,
+        state: State,
+        spatial_op: SpatialOperator,
+        grid: Grid,
+        config: SolverConfig,
+    ) -> float:
+        """The integrator owns dt (v2). Default preserves v1 behavior:
+        config.dt if set, else the spatial operator's CFL estimate.
+        Local/adaptive time-stepping integrators override this and may
+        ignore the loop's dt entirely inside step().
+        """
+        if config.dt is not None:
+            return config.dt
+        return spatial_op.compute_timestep(state, grid, config.cfl)
+
 
 class ForwardEuler(TimeIntegrator):
     """Explicit forward-Euler: u_new = u + dt * rhs."""

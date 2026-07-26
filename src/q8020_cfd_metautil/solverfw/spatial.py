@@ -38,3 +38,16 @@ class SpatialOperator(ABC):
         Override for multi-variable systems with wave speeds.
         """
         return cfl * grid.dx
+
+    def compute_local_timestep(
+        self,
+        state: State,
+        grid: Grid,
+        cfl: float,
+    ) -> tuple[float, np.ndarray | None]:
+        """Per-cell time-step for local time-stepping integrators (v2).
+
+        Returns (dt_min, dt_per_cell). Default derives from the scalar
+        compute_timestep with no per-cell array; override to supply one.
+        """
+        return self.compute_timestep(state, grid, cfl), None

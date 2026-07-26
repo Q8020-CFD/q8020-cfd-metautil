@@ -1,7 +1,9 @@
 """solverfw -- pluggable CFD solver framework.
 
-Provides abstract base classes and shared implementations for
-time-marching PDE solvers (classical and quantum).
+Provides abstract base classes and shared implementations for PDE
+solvers (classical and quantum), plus the v2 survey vocabulary:
+problem types, execution-target declarations, pluggable convergence,
+per-slot validators, and the plugin registry.
 
 Usage from an application package::
 
@@ -11,7 +13,20 @@ Usage from an application package::
     )
 """
 
+from q8020_cfd_metautil.solverfw.backend import (
+    Backend,
+    ClassicalTarget,
+    MitigationSpec,
+    NoiseSpec,
+    QiskitBackend,
+    TranspileSpec,
+)
 from q8020_cfd_metautil.solverfw.config import SolverConfig
+from q8020_cfd_metautil.solverfw.convergence import (
+    ConvergencePredicate,
+    ResidualRatio,
+    ResidualVsInitial,
+)
 from q8020_cfd_metautil.solverfw.grid import Grid, Grid1D
 from q8020_cfd_metautil.solverfw.state import DenseState, State
 from q8020_cfd_metautil.solverfw.spatial import SpatialOperator
@@ -24,27 +39,60 @@ from q8020_cfd_metautil.solverfw.linsys import (
     LUSolver,
     LinearSystemSolver,
     NullLinearSystemSolver,
+    SolveContext,
 )
 from q8020_cfd_metautil.solverfw.postprocess import (
     NullPostProcessor,
     PostProcessor,
 )
+from q8020_cfd_metautil.solverfw.problem_type import ProblemType
+from q8020_cfd_metautil.solverfw.registry import (
+    REGISTRY,
+    ForeignInfo,
+    KnobSpec,
+    PluginSpec,
+    Registry,
+    SLOTS,
+)
+from q8020_cfd_metautil.solverfw.validate import (
+    ValidationResult,
+    Validator,
+)
 from q8020_cfd_metautil.solverfw.loop import MainLoop
 
 __all__ = [
+    "Backend",
+    "ClassicalTarget",
+    "ConvergencePredicate",
     "DenseState",
+    "ForeignInfo",
     "ForwardEuler",
     "GMRESSolver",
     "Grid",
     "Grid1D",
+    "KnobSpec",
     "LUSolver",
     "LinearSystemSolver",
     "MainLoop",
+    "MitigationSpec",
+    "NoiseSpec",
     "NullLinearSystemSolver",
     "NullPostProcessor",
+    "PluginSpec",
     "PostProcessor",
+    "ProblemType",
+    "QiskitBackend",
+    "REGISTRY",
+    "Registry",
+    "ResidualRatio",
+    "ResidualVsInitial",
+    "SLOTS",
+    "SolveContext",
     "SolverConfig",
     "SpatialOperator",
     "State",
     "TimeIntegrator",
+    "TranspileSpec",
+    "ValidationResult",
+    "Validator",
 ]
