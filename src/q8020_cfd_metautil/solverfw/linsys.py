@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
+
+if TYPE_CHECKING:
+    from q8020_cfd_metautil.solverfw.backend import Backend
+    from q8020_cfd_metautil.solverfw.encode import Encoder
+    from q8020_cfd_metautil.solverfw.readout import Readout
 
 
 @dataclass
@@ -85,3 +90,52 @@ class NullLinearSystemSolver(LinearSystemSolver):
             "NullLinearSystemSolver.solve() called -- this integrator "
             "does not require a linear system solver."
         )
+
+
+@dataclass
+class LinearSolveResult:
+    """A quantum solve's native output (SPEC v2 §4.7).
+
+    The circuit yields a normalized *direction*; the physical *scale* is
+    recovered classically. x = direction * scale.
+    """
+
+    direction: np.ndarray
+    scale: float
+    metrics: dict[str, Any] = field(default_factory=dict)
+
+
+class QuantumLinearSystemSolver(LinearSystemSolver):
+    """Base for quantum linear solvers (HHL, SQLS-as-linsolve).
+
+    Holds injected sub-plugins (Backend, Encoder, Readout) so they are
+    recorded rather than smuggled through a config dict. Subclasses
+    implement solve_quantum() returning a LinearSolveResult; the base
+    solve() returns the scaled x = direction * scale, so classical callers
+    (Euler's BDF integrator) see the same (x, metrics) contract as LU/GMRES
+    and no isinstance-dispatch is needed.
+    """
+
+    def __init__(
+        self,
+        backend: Backend | None = None,
+        encoder: Encoder | None = None,
+        readout: Readout | None = None,
+    ) -> None:
+        self.backend = backend
+        self.encoder = encoder
+        self.readout = readout
+
+    @abstractmethod
+    def solve_quantum(
+        self,
+        A: np.ndarray,
+        b: np.ndarray,
+        ctx: SolveContext | None = None,
+    ) -> LinearSolveResult:
+        """Return the native (direction, scale, metrics) of the quantum solve."""
+
+    def solve(self, A, b, ctx=None):
+        result = self.solve_quantum(A, b, ctx)
+        x = result.direction * result.scale
+        return x, result.metrics

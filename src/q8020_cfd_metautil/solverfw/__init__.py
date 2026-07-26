@@ -43,9 +43,11 @@ from q8020_cfd_metautil.solverfw.transform import (
 )
 from q8020_cfd_metautil.solverfw.linsys import (
     GMRESSolver,
-    LUSolver,
+    LinearSolveResult,
     LinearSystemSolver,
+    LUSolver,
     NullLinearSystemSolver,
+    QuantumLinearSystemSolver,
     SolveContext,
 )
 from q8020_cfd_metautil.solverfw.postprocess import (
@@ -87,8 +89,10 @@ __all__ = [
     "Grid1D",
     "KnobSpec",
     "LUSolver",
+    "LinearSolveResult",
     "LinearSystemSolver",
     "MainLoop",
+    "QuantumLinearSystemSolver",
     "MitigationSpec",
     "NoiseSpec",
     "NullLinearSystemSolver",
