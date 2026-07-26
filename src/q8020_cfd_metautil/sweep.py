@@ -2141,6 +2141,18 @@ def reset_pruned_conflicts() -> None:
     PRUNED_CONFLICTS.clear()
 
 
+def pruned_conflicts_provenance() -> dict[str, Any] | None:
+    """Return a code.provenance dict of pruned cells, or None if none.
+
+    Pass to ``make_code_meta(provenance=...)`` so each surviving case's
+    ledger records that the sweeper dropped invalid siblings (SPEC v2b
+    §2b.5 -- auditable "no invalid cell ran").
+    """
+    if not PRUNED_CONFLICTS:
+        return None
+    return {"pruned_conflicts": list(PRUNED_CONFLICTS)}
+
+
 def _case_chain(params: dict) -> dict[str, dict[str, Any]] | None:
     """Build a registry chain ``{slot: {"plugin", "knobs"}}`` from *params*
     if it uses the v2 slot vocabulary, else ``None``.
@@ -2270,7 +2282,9 @@ def _prune_expanded_cases(expanded_cases: list) -> list:
             continue
 
         if registry is None:
-            # Import + populate only when a chain is actually seen.
+            # Import + populate only when a chain is actually seen. Register
+            # every known plugin set so cross-code conflicts (e.g. sqls
+            # truncated_mps vs encode.state_prep=mps) are enforced too.
             from q8020_cfd_metautil.solverfw import (  # noqa: PLC0415
                 REGISTRY,
             )
@@ -2278,6 +2292,18 @@ def _prune_expanded_cases(expanded_cases: list) -> list:
                 plugins_euler,
             )
             plugins_euler.register_all()
+            try:  # ch-lbm slots (present when that code is installed)
+                from q8020_cfd_metautil.solverfw import (  # noqa: PLC0415
+                    plugins_chlbm,
+                )
+                plugins_chlbm.register_all()
+            except ImportError:
+                pass
+            try:  # sqls encode plugins (separate package)
+                import q8020_sqls_encode.plugins as _sqls_pl  # noqa: PLC0415
+                _sqls_pl.register_all()
+            except ImportError:
+                pass
             registry = REGISTRY
 
         violations = registry.check_cell(chain)

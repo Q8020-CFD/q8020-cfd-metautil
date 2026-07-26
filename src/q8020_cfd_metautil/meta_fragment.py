@@ -224,29 +224,86 @@ def make_axequalsb_case(
     return case
 
 
+def chain_entry(
+    slot: str,
+    plugin: str,
+    knobs: dict[str, Any] | None = None,
+    *,
+    kind: str | None = None,
+    sub: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build one code.chain entry (SPEC v2b §2b.3).
+
+    slot -> {"plugin": name, "knobs": {...}, ["kind": ...], ["sub": {...}]}.
+    kind="container" marks a container plugin; sub holds its named
+    sub-plugin entries (encode / readout / ...).
+    """
+    entry: dict[str, Any] = {"plugin": plugin}
+    if knobs:
+        entry["knobs"] = knobs
+    if kind is not None:
+        entry["kind"] = kind
+    if sub:
+        entry["sub"] = sub
+    return entry
+
+
+def make_chain(**entries: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Assemble a code.chain from per-slot entries: make_chain(encode=...)."""
+    return {slot: entry for slot, entry in entries.items()}
+
+
 def make_code_meta(
     algorithm: str,
     entry_point: str,
     run_args: dict[str, Any] | None = None,
+    *,
+    chain: dict[str, Any] | None = None,
+    problem_type: str | None = None,
+    adaptation: int | None = None,
+    origin: str | None = None,
+    foreign: dict[str, Any] | None = None,
+    provenance: dict[str, Any] | None = None,
     **extras: Any,
 ) -> dict[str, Any]:
     """
     Build code dict describing the implementation.
 
     Args:
-        algorithm: Algorithm token name (e.g., "hhl", "vqls", "cks")
-        entry_point: Entry point script (e.g., "ax_equals_b_hhl.py")
-        run_args: Algorithm-specific configuration. Use vars(args) to convert
-                  argparse Namespace to dict, or pass a dict directly.
-        **extras: Additional code-specific fields
+        algorithm: Algorithm token name (kept as the human label).
+        entry_point: Entry point script.
+        run_args: Algorithm-specific config (kept for backward compat).
+        chain: Slot-structured plugin graph (SPEC v2b §2b.3), 1:1 with the
+               runtime object graph. Built via make_chain / chain_entry.
+               backend is NEVER embedded here -- it stays its own section.
+        problem_type: "ivp" | "lbvp" | "nlbvp" | "evp".
+        adaptation: foreign-code adaptation rung 0-4 (SPEC v2 §8).
+        origin: "native" | "foreign".
+        foreign: provenance dict {lib, version, symbols} for foreign codes.
+        provenance: e.g. {"pruned_conflicts": [...]} from the sweeper.
+        **extras: Additional code-specific fields.
 
     Returns:
-        Code dict ready for write_code
+        Code dict ready for write_code. chain / problem_type / adaptation /
+        origin / foreign are added only when provided, so a call without
+        them is byte-identical to the pre-v2b output.
     """
     code: dict[str, Any] = {
         "algorithm": algorithm,
         "entry_point": entry_point,
     }
+    if problem_type is not None:
+        code["problem_type"] = problem_type
+    if origin is not None:
+        code["origin"] = origin
+    if adaptation is not None:
+        code["adaptation"] = adaptation
+    if foreign is not None:
+        code["foreign"] = foreign
+    if chain is not None:
+        code["chain"] = chain
+    if provenance is not None:
+        code["provenance"] = provenance
     if run_args is not None:
         code["run_args"] = run_args
     code.update(extras)

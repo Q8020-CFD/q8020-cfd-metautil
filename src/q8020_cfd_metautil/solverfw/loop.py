@@ -24,8 +24,12 @@ from q8020_cfd_metautil.solverfw.grid import Grid
 from q8020_cfd_metautil.solverfw.postprocess import PostProcessor
 from q8020_cfd_metautil.solverfw.problem_type import ProblemType
 from q8020_cfd_metautil.solverfw.spatial import SpatialOperator
-from q8020_cfd_metautil.solverfw.state import State
-from q8020_cfd_metautil.solverfw.time_integrator import TimeIntegrator
+from q8020_cfd_metautil.solverfw.state import DenseState, State
+from q8020_cfd_metautil.solverfw.time_integrator import (
+    ContainerIntegrator,
+    TimeIntegrator,
+)
+from q8020_cfd_metautil.solverfw.transform import ProblemTransform
 from q8020_cfd_metautil.solverfw.validate import Validator, run_validators
 
 
@@ -45,6 +49,7 @@ class MainLoop:
         post: PostProcessor | None = None,
         convergence: ConvergencePredicate | None = None,
         validators: dict[str, list[Validator]] | None = None,
+        transform: ProblemTransform | None = None,
     ) -> tuple[list[np.ndarray], list[dict[str, Any]] | None]:
         """Execute the iteration loop.
 
@@ -53,7 +58,36 @@ class MainLoop:
         step_metrics_list is a list of per-step dicts (may be empty).
         Validation records (if any validators ran) are appended to the
         last step's metrics under the key "_validation".
+
+        A ContainerIntegrator is detected and driven via run_all() once
+        (SPEC v2 §4.5). An optional ProblemTransform (§4.4) brackets the
+        solve: forward once before, inverse on every recorded snapshot so
+        the returned solutions are always in u-space.
         """
+        # Change-of-variables bracket (identity when no transform given).
+        # The solve marches v-space; recorded solutions are mapped back.
+        if transform is not None:
+            u0 = state.to_dense()
+            v0, carry = transform.forward(u0, grid, config)
+            state = DenseState(np.asarray(v0))
+
+        # Container branch: the integrator owns its own loop and sub-plugins.
+        if isinstance(integrator, ContainerIntegrator):
+            wall_start = time.perf_counter()
+            result = integrator.run_all(state, spatial_op, grid, config)
+            raw_solutions = result.solutions
+            if transform is not None:
+                solutions = [
+                    transform.inverse(v, carry, grid, config)
+                    for v in raw_solutions
+                ]
+            else:
+                solutions = list(raw_solutions)
+            elapsed = time.perf_counter() - wall_start
+            if post is not None:
+                self._finalize(post, config, elapsed, solutions, grid)
+            return solutions, result.step_metrics
+
         n_steps = config.n_steps
         if config.problem_type is ProblemType.LBVP:
             if n_steps is None:
@@ -135,6 +169,12 @@ class MainLoop:
             if not all_metrics:
                 all_metrics.append({})
             all_metrics[-1]["_validation"] = validation_records
+
+        # Map recorded snapshots back to u-space (no-op without a transform).
+        if transform is not None:
+            solutions = [
+                transform.inverse(v, carry, grid, config) for v in solutions
+            ]
 
         elapsed = time.perf_counter() - wall_start
         if post is not None:

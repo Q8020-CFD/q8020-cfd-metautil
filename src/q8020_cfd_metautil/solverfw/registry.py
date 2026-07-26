@@ -33,6 +33,26 @@ class ForeignInfo:
     symbols: tuple[str, ...] = ()
 
 
+class ForeignPlugin:
+    """Mixin marking an adapter that wraps a foreign code (SPEC v2 §8).
+
+    Carries machine-readable provenance so a run self-describes as foreign
+    and its adaptation rung lands in the ledger's code section. The rung is
+    a property of the adapter plugin, not the run (decision B.6-Q1).
+    """
+
+    foreign: ForeignInfo
+    rung: int = 2
+
+    def foreign_meta(self) -> dict[str, object]:
+        """Serialisable {lib, version, symbols} for the code section."""
+        return {
+            "lib": self.foreign.lib,
+            "version": self.foreign.version,
+            "symbols": list(self.foreign.symbols),
+        }
+
+
 @dataclass(frozen=True)
 class KnobSpec:
     name: str

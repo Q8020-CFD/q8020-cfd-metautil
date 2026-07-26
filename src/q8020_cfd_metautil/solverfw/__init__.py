@@ -32,8 +32,14 @@ from q8020_cfd_metautil.solverfw.grid import Grid, Grid1D
 from q8020_cfd_metautil.solverfw.state import DenseState, State
 from q8020_cfd_metautil.solverfw.spatial import SpatialOperator
 from q8020_cfd_metautil.solverfw.time_integrator import (
+    ContainerIntegrator,
+    ContainerResult,
     ForwardEuler,
     TimeIntegrator,
+)
+from q8020_cfd_metautil.solverfw.transform import (
+    IdentityTransform,
+    ProblemTransform,
 )
 from q8020_cfd_metautil.solverfw.linsys import (
     GMRESSolver,
@@ -51,6 +57,7 @@ from q8020_cfd_metautil.solverfw.readout import Readout, ReadoutContext
 from q8020_cfd_metautil.solverfw.registry import (
     REGISTRY,
     ForeignInfo,
+    ForeignPlugin,
     KnobSpec,
     PluginSpec,
     Registry,
@@ -65,12 +72,16 @@ from q8020_cfd_metautil.solverfw.loop import MainLoop
 __all__ = [
     "Backend",
     "ClassicalTarget",
+    "ContainerIntegrator",
+    "ContainerResult",
     "ConvergencePredicate",
     "DenseState",
     "EncodeResult",
     "Encoder",
     "ForeignInfo",
+    "ForeignPlugin",
     "ForwardEuler",
+    "IdentityTransform",
     "GMRESSolver",
     "Grid",
     "Grid1D",
@@ -84,6 +95,7 @@ __all__ = [
     "NullPostProcessor",
     "PluginSpec",
     "PostProcessor",
+    "ProblemTransform",
     "ProblemType",
     "QiskitBackend",
     "REGISTRY",
