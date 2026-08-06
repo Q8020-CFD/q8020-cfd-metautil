@@ -256,6 +256,12 @@ q8020-sweep config.toml --set _solver_dir=/opt/venvs/solver
 
 Unresolved tokens (no matching global key) are left as-is.
 
+Expansion is **recursive**: a variable's value may itself contain
+`${VAR}` tokens, which are resolved in turn (e.g.
+`_script = "${_launch} python solver.py"` where
+`_launch = "custom_tool -n ${_ranks}"`).  A reference cycle
+(`a = "${b}"`, `b = "${a}"`) raises an error naming the offending keys.
+
 #### Sweeper directives (`_` keys)
 
 **Execution:**
@@ -264,10 +270,31 @@ Unresolved tokens (no matching global key) are left as-is.
 |---|---|---|---|
 | `_script` | string | -- | Shell command to run.  May include `&&`, pipes, etc. |
 | `_env` | string | -- | Path to venv; auto-activated before the solver command and snapshotted before/after each case |
+| `_env_exports` | table | -- | Environment variables for the solver (see below) |
 | `_output_dir` | string | `./sweep_results` | Root output directory |
 | `_run_mode` | string | `sequential` | `sequential` or `parallel` |
 | `_case_timeout` | int/null | none | Per-case timeout in seconds |
 | `_trials` | int | 1 | Replicate each case N times (nested dirs) |
+
+**Environment variables (`_env_exports`):**  Declare env vars once in the
+TOML instead of chaining `export ... &&` inside `_script`, so the same
+config runs locally and under SLURM:
+
+```toml
+[global._env_exports]
+MPICH_GPU_SUPPORT_ENABLED = "1"
+LD_LIBRARY_PATH = "/opt/rocm-6.2.4/lib:$LD_LIBRARY_PATH"
+```
+
+Under SLURM the variables are emitted as `export` lines in the generated
+sbatch (after the sweeper's default `OMP_NUM_THREADS=1` etc., so your
+values win); `$VAR` references are expanded by bash at runtime on the
+compute node.  For local and `_slurm_interactive` runs the variables are
+injected into the solver's process environment, with `$VAR` references
+expanded against the current environment (unknown vars left verbatim —
+e.g. `$SLURM_CPUS_PER_TASK` stays literal outside a SLURM job).
+`_env_exports` is a **global-level** directive: the whole sweep shares
+one environment (the sbatch is generated once per job).
 
 **Injection (passing sweep context to the solver):**
 
@@ -332,12 +359,35 @@ submitting.
 | `_slurm_exclusive_node` | bool | false | Pin each case to its own node |
 | `_slurm_cores_per_node` | int | 64 | Cores per node (packed mode only) |
 | `_slurm_pack_venvs` | list | [] | Venv paths to auto-tar and broadcast to NVMe |
+| `_slurm_tasks_per_case` | int | 1 | MPI ranks per case; >1 marks cases as distributed (see below) |
+| `_slurm_tasks_per_node` | int | 8 | Ranks per node for distributed cases |
+| `_slurm_launcher` | string | `auto` | `auto` / `srun` / `none` — synthesized launcher for distributed cases (see below) |
+| `_slurm_gpus_per_task` | int | -- | Adds `--gpus-per-task=N` to the synthesized launcher |
 
 **Node allocation:**  By default the sweeper packs multiple cases per
 node (`tasks_per_node = cores_per_node // cores_per_task`).  Set
 `_slurm_exclusive_node = true` to request one node per case instead.
 When exclusive mode is on, `_slurm_cores_per_task` and
 `_slurm_cores_per_node` are ignored.
+
+**Distributed (MPI) cases:**  `_slurm_tasks_per_case > 1` marks each case
+as a multi-rank run: the job is sized for ONE case
+(`nodes = ceil(tasks_per_case / tasks_per_node)`) and cases run
+sequentially, because concurrent multi-rank job steps race in Cray
+MPICH's PMI/shared-memory init.  The sweeper **synthesizes the launcher**
+for you — `_script` stays a bare `python solver.py`, and the solver
+command becomes:
+
+```
+srun -N <nodes> -n <tasks_per_case> --ntasks-per-node=<tasks_per_node> \
+    [--gpus-per-task=<g>] --exclusive <_script>
+```
+
+`_slurm_launcher` controls this: `auto` (default) synthesizes unless
+`_script` already contains its own `srun`/`mpirun`/`mpiexec` token
+(legacy configs keep working); `srun` always synthesizes; `none` never
+does.  With `--set _slurm=false` the same TOML runs locally — no
+launcher, no sbatch.
 
 **NVMe venv broadcast:**  For large-scale runs, set `_slurm_pack_venvs`
 to a list of venv directories.  Before submission the sweeper tars each

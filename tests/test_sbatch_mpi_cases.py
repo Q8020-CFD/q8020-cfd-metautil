@@ -112,3 +112,63 @@ def test_mpi_workers_run_sequentially_not_backgrounded(tmp_path):
     workers = _worker_lines(script)
     assert len(workers) == 2
     assert all(not w.rstrip().endswith("&") for w in workers)
+
+
+# --------------------------------------------------------------------------
+# _env_exports emission
+# --------------------------------------------------------------------------
+
+def test_env_exports_absent_by_default(tmp_path):
+    script = _generate_sbatch_script(
+        _cases_info(tmp_path), _base_params(), tmp_path,
+    )
+    assert "# --- User environment (_env_exports) ---" not in script
+
+
+def test_env_exports_emitted_as_export_lines(tmp_path):
+    params = _base_params()
+    params["_env_exports"] = {
+        "MPICH_GPU_SUPPORT_ENABLED": "1",
+        "LD_LIBRARY_PATH": "/opt/rocm/lib:$LD_LIBRARY_PATH",
+    }
+    script = _generate_sbatch_script(
+        _cases_info(tmp_path), params, tmp_path,
+    )
+    assert 'export MPICH_GPU_SUPPORT_ENABLED="1"' in script
+    # $VARS left for bash to expand at runtime on the compute node
+    assert 'export LD_LIBRARY_PATH="/opt/rocm/lib:$LD_LIBRARY_PATH"' in script
+
+
+def test_env_exports_after_default_thread_exports(tmp_path):
+    # User exports must come after the hardcoded OMP/MKL exports so a
+    # user-specified OMP_NUM_THREADS wins.
+    params = _base_params()
+    params["_env_exports"] = {"OMP_NUM_THREADS": "$SLURM_CPUS_PER_TASK"}
+    script = _generate_sbatch_script(
+        _cases_info(tmp_path), params, tmp_path,
+    )
+    default_pos = script.index("export OMP_NUM_THREADS=1")
+    user_pos = script.index(
+        'export OMP_NUM_THREADS="$SLURM_CPUS_PER_TASK"'
+    )
+    assert user_pos > default_pos
+
+
+def test_env_exports_values_coerced_to_str(tmp_path):
+    params = _base_params()
+    params["_env_exports"] = {"SHOTS": 1000}
+    script = _generate_sbatch_script(
+        _cases_info(tmp_path), params, tmp_path,
+    )
+    assert 'export SHOTS="1000"' in script
+
+
+def test_env_exports_rejects_non_table(tmp_path):
+    import pytest
+
+    params = _base_params()
+    params["_env_exports"] = "FOO=1"
+    with pytest.raises(ValueError, match="_env_exports"):
+        _generate_sbatch_script(
+            _cases_info(tmp_path), params, tmp_path,
+        )

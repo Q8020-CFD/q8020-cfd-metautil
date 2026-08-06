@@ -102,6 +102,54 @@ def _expand_templates(
     return obj
 
 
+def _expand_templates_fixpoint(
+    obj: Any,
+    variables: dict[str, Any],
+    max_passes: int = 10,
+) -> Any:
+    """Expand ``${VAR}`` tokens repeatedly until the result is stable, so
+    variables whose values themselves contain ``${...}`` references resolve
+    fully (e.g. ``_script = "${_launch} solver.py"`` with
+    ``_launch = "srun -n ${_ranks} python"``).
+
+    Unknown tokens are left verbatim (same as ``_expand_templates``).
+    Raises ValueError if the expansion has not converged after *max_passes*
+    iterations, which indicates a reference cycle.
+    """
+    for _ in range(max_passes):
+        expanded = _expand_templates(obj, variables)
+        if expanded == obj:
+            return expanded
+        obj = expanded
+    # One more pass to name the offenders: anything that still changes
+    # is part of a cycle.
+    final = _expand_templates(obj, variables)
+    unstable = sorted(
+        {
+            m
+            for s in _iter_strings(final)
+            for m in _TEMPLATE_RE.findall(s)
+            if m in variables
+        }
+    )
+    raise ValueError(
+        f"Template expansion did not converge after {max_passes} passes; "
+        f"likely a ${{VAR}} reference cycle involving: {unstable}"
+    )
+
+
+def _iter_strings(obj: Any):
+    """Yield every string contained in a nested dict/list/str structure."""
+    if isinstance(obj, str):
+        yield obj
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            yield from _iter_strings(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _iter_strings(v)
+
+
 def _extract_script_dir(script_cmd: str | None) -> Path | None:
     """Extract the script's parent dir from a (possibly compound) command.
 
@@ -533,11 +581,13 @@ def run_single(
     timeout: int | None = None,
     artifact_dir: Path | None = None,
     env_path: str | None = None,
+    process_env: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Run one case command with full metadata capture (the inner function
     run_sweep() calls per case).  *case_dir* must already exist; *env_path*
-    is snapshotted before and after.  Returns a result dict whose status is
-    "success", "timeout", or "exception".
+    is snapshotted before and after.  *process_env* replaces the subprocess
+    environment when given (None = inherit).  Returns a result dict whose
+    status is "success", "timeout", or "exception".
     """
     # Default artifact_dir to case_dir if not specified
     if artifact_dir is None:
@@ -605,10 +655,14 @@ def run_single(
 
     try:
         # Run the command, capturing stdout and stderr while also echoing to console
+        run_kwargs: dict[str, Any] = {}
+        if process_env is not None:
+            run_kwargs["env"] = process_env
         result = subprocess_tee.run(
             command,
             check=False,
             timeout=timeout,
+            **run_kwargs,
         )
 
         # Record end time
@@ -1176,6 +1230,7 @@ def _finalize_slurm_interactive(
         f"  {CYAN}Using salloc allocation:{RESET} {alloc_id}"
     )
 
+    worker_env = _resolve_env_exports(global_params)
     inflight: list[dict[str, Any]] = []
 
     for info in all_cases_info:
@@ -1202,6 +1257,7 @@ def _finalize_slurm_interactive(
             srun_cmd,
             stdout=fout,
             stderr=ferr,
+            env=worker_env,
         )
         inflight.append({
             "proc": proc,
@@ -1310,6 +1366,7 @@ def _finalize_local_parallel(
             all_results[eid]["status"] = "dry_run"
         return
 
+    worker_env = _resolve_env_exports(global_params)
     inflight: list[dict[str, Any]] = []
 
     for info in all_cases_info:
@@ -1335,6 +1392,7 @@ def _finalize_local_parallel(
             worker_cmd,
             stdout=fout,
             stderr=ferr,
+            env=worker_env,
         )
         inflight.append({
             "proc": proc,
@@ -1471,6 +1529,97 @@ def _pack_venvs(
         packed[str(venv_dir)] = tarball
 
     return packed
+
+
+def _get_env_exports(global_params: dict[str, Any]) -> dict[str, str]:
+    """Validate and normalize the ``_env_exports`` directive.
+
+    Returns a ``{name: value}`` dict with values coerced to str.  Raises
+    ValueError if the key is present but not a TOML table.
+    """
+    raw = global_params.get("_env_exports")
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError(
+            "_env_exports must be a TOML table of NAME = value pairs, "
+            f"got {type(raw).__name__}: {raw!r}"
+        )
+    return {str(k): str(v) for k, v in raw.items()}
+
+
+def _resolve_env_exports(
+    global_params: dict[str, Any],
+) -> dict[str, str] | None:
+    """Build the process environment for local / interactive execution:
+    ``os.environ`` overlaid with ``_env_exports`` values.  ``$VAR``
+    references in values are expanded against the current environment
+    (unknown vars are left verbatim).  Returns None when no exports are
+    configured, so callers can pass it straight to ``env=`` (None =
+    inherit).
+    """
+    exports = _get_env_exports(global_params)
+    if not exports:
+        return None
+    env = os.environ.copy()
+    for name, value in exports.items():
+        env[name] = os.path.expandvars(value)
+    return env
+
+
+_LAUNCHER_BASENAMES = {"srun", "mpirun", "mpiexec"}
+
+
+def _script_has_launcher(script_cmd: str) -> bool:
+    """True if any whitespace token of *script_cmd* is itself a parallel
+    launcher (srun/mpirun/mpiexec).  Matches on the token's basename so
+    ``/usr/bin/srun`` counts but a path merely containing the substring
+    (e.g. ``~/my-srun-env/bin/python``) does not.
+    """
+    for token in script_cmd.split():
+        if os.path.basename(token) in _LAUNCHER_BASENAMES:
+            return True
+    return False
+
+
+def _synthesize_launcher_prefix(params: dict[str, Any]) -> str | None:
+    """Build the ``srun ...`` prefix for a multi-rank Slurm case from the
+    ``_slurm_*`` geometry directives, or return None if no launcher should
+    be synthesized.  *params* is the group's merged param dict.
+
+    ``_slurm_launcher`` modes:
+      - ``"auto"`` (default): synthesize when ``_slurm_tasks_per_case > 1``
+        unless ``_script`` already carries its own launcher token.
+      - ``"srun"``: always synthesize (no back-off).
+      - ``"none"``: never synthesize.
+    """
+    mode = str(params.get("_slurm_launcher", "auto")).lower()
+    if mode not in ("auto", "srun", "none"):
+        raise ValueError(
+            f"_slurm_launcher must be 'auto', 'srun', or 'none', "
+            f"got: {mode!r}"
+        )
+    if mode == "none":
+        return None
+
+    tasks_per_case = int(params.get("_slurm_tasks_per_case", 1))
+    if tasks_per_case <= 1:
+        return None
+
+    tasks_per_node = int(params.get("_slurm_tasks_per_node", 8))
+    n_nodes = -(-tasks_per_case // tasks_per_node)
+
+    parts = [
+        "srun",
+        f"-N {n_nodes}",
+        f"-n {tasks_per_case}",
+        f"--ntasks-per-node={tasks_per_node}",
+    ]
+    gpus_per_task = params.get("_slurm_gpus_per_task")
+    if gpus_per_task is not None:
+        parts.append(f"--gpus-per-task={int(gpus_per_task)}")
+    parts.append("--exclusive")
+    return " ".join(parts)
 
 
 def _generate_sbatch_script(
@@ -1631,6 +1780,19 @@ echo ""
     if dependency_job_id:
         dependency_line = f"#SBATCH --dependency=afterok:{dependency_job_id}\n"
 
+    # User-declared environment (_env_exports).  Emitted AFTER the default
+    # thread-count exports so user values win.  Values are NOT expanded
+    # here: bash expands $VARS at runtime on the compute node (needed for
+    # e.g. LD_LIBRARY_PATH appends and $SLURM_CPUS_PER_TASK).
+    env_exports_block = ""
+    env_exports = _get_env_exports(global_params)
+    if env_exports:
+        lines = ["# --- User environment (_env_exports) ---"]
+        for name, value in env_exports.items():
+            lines.append(f'export {name}="{value}"')
+        lines.append("")
+        env_exports_block = "\n".join(lines)
+
     script = f"""\
 #!/bin/bash
 #SBATCH -J q8020_sweep
@@ -1651,7 +1813,7 @@ echo ""
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
-
+{env_exports_block}
 cd $SLURM_SUBMIT_DIR || exit 1
 
 {env_section}
@@ -2417,11 +2579,13 @@ def run_sweep(
                     except ValueError:
                         global_params[target_key] = value
 
-    # Expand ${VAR} templates throughout the config using global params
+    # Expand ${VAR} templates throughout the config using global params.
+    # Fixpoint expansion: values may reference other ${VAR}s that themselves
+    # contain templates, so iterate until stable (cycle-guarded).
     global_params.update(
-        _expand_templates(global_params, global_params)
+        _expand_templates_fixpoint(global_params, global_params)
     )
-    config["groups"] = _expand_templates(
+    config["groups"] = _expand_templates_fixpoint(
         config["groups"], global_params
     )
 
@@ -2440,10 +2604,12 @@ def run_sweep(
     for group_data in config["groups"].values():
         merged_gp = {**group_data["params"]}
         for k, v in global_params.items():
-            # A global key wins over a case param when it is a meta-key,
-            # absent from the case, OR an explicit --set override (which
-            # must beat the stale case copy duplicated at load time).
-            if k.startswith("_") or k not in merged_gp or k in override_keys:
+            # A global key wins over a case param when it is absent from
+            # the case OR an explicit --set override (which must beat the
+            # stale case copy duplicated at load time).  Group-authored
+            # values — including _-prefixed meta-keys like a per-group
+            # _script — are preserved: group-level keys override globals.
+            if k not in merged_gp or k in override_keys:
                 # If this is an override key given bare, also remove any
                 # dashed variant so we don't get duplicates on the CLI.
                 if k in override_keys and not k.startswith("-"):
@@ -2455,7 +2621,7 @@ def run_sweep(
         for cid, cparams in group_data["expanded_cases"].items():
             merged_cp = {**cparams}
             for k, v in global_params.items():
-                if k.startswith("_") or k not in merged_cp or k in override_keys:
+                if k not in merged_cp or k in override_keys:
                     if k in override_keys and not k.startswith("-"):
                         for pfx in ("--", "-"):
                             merged_cp.pop(pfx + k, None)
@@ -2591,6 +2757,30 @@ def run_sweep(
                 f"Group '{group_id}' has no executable: set a global "
                 "_script or a per-group _script."
             )
+
+        # Synthesize the multi-rank srun launcher for Slurm batch cases so
+        # _script can stay a bare `python solver.py` across platforms.
+        # Injected before the _env activation prepend: the composed command
+        # is `source .../activate && srun ... python solver.py`.
+        if use_slurm and run_mode == "parallel":
+            launcher_prefix = _synthesize_launcher_prefix(group_params)
+            if launcher_prefix:
+                launcher_mode = str(
+                    group_params.get("_slurm_launcher", "auto")
+                ).lower()
+                if (
+                    launcher_mode == "auto"
+                    and _script_has_launcher(group_executable)
+                ):
+                    print(
+                        f"  {DIM}_script already carries a launcher; "
+                        f"not synthesizing srun for group "
+                        f"'{group_id}'{RESET}"
+                    )
+                else:
+                    group_executable = (
+                        f"{launcher_prefix} {group_executable}"
+                    )
 
         # If _env is set, prepend venv activation
         env_path = group_params.get("_env")
@@ -2837,6 +3027,7 @@ def run_sweep(
                 case_params=params,
                 timeout=params.get("_case_timeout"),
                 env_path=env_path,
+                process_env=_resolve_env_exports(global_params),
             )
 
             results["cases"][experiment_id] = case_result

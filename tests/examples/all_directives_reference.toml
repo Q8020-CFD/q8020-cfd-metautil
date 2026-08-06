@@ -41,6 +41,20 @@ _trials       = 1                  # replicate each expanded case N times (stoch
 #     <_output_dir>/<YYYY-MM-DD>/<workflow_id>/<experiment_id>/
 _output_dir = "~/q8020/all_directives_demo"
 
+# --- Environment variables --------------------------------------------------
+# Declared once instead of chained `export ... &&` inside _script, so the
+# same TOML runs locally and under SLURM.  Under SLURM these become
+# `export K="V"` lines in the generated sbatch (after the sweeper's default
+# OMP/MKL exports, so your values win; $VARS expand at runtime on the
+# node).  Locally / in _slurm_interactive mode they are injected into the
+# solver's process environment ($VARS expanded against the current env;
+# unknown ones like $SLURM_CPUS_PER_TASK stay literal).  Global-level only.
+# NOTE: the `[global._env_exports]` table form also works, but in TOML it
+# must be placed AFTER all direct [global] keys; the inline form used here
+# can sit anywhere in the section.
+
+_env_exports = { Q8020_DEMO_VAR = "1" }  # e.g. { LD_LIBRARY_PATH = "/opt/rocm/lib:$LD_LIBRARY_PATH" }
+
 # --- Injection: pass sweep context to the solver ---------------------------
 # Each `_inject_*` names a CLI flag the sweeper appends to `_script`.
 # With the values below, the actual command becomes:
@@ -76,6 +90,20 @@ _slurm_cores_per_task  = 1          # CPUs per srun task
 _slurm_cores_per_node  = 64         # used only in packed (non-exclusive) mode
 _slurm_exclusive_node  = false      # one node per case if true
                                     # (overrides the cores_per_* knobs)
+
+# Distributed (MPI) cases: tasks_per_case > 1 sizes the job for ONE case
+# (nodes = ceil(tasks_per_case / tasks_per_node)) and runs cases
+# SEQUENTIALLY (concurrent multi-rank steps race in Cray MPICH PMI init).
+# The sweeper synthesizes the launcher so _script stays a bare
+# `python solver.py`:
+#     srun -N <nodes> -n <tasks> --ntasks-per-node=<tpn> \
+#         [--gpus-per-task=<g>] --exclusive <_script>
+_slurm_tasks_per_case = 1           # MPI ranks per case; >1 = distributed
+_slurm_tasks_per_node = 8           # ranks per node (Frontier: 1 per GCD)
+_slurm_launcher       = "auto"      # "auto": synthesize unless _script already
+                                    #   has srun/mpirun/mpiexec; "srun": always;
+                                    #   "none": never
+# _slurm_gpus_per_task = 1          # adds --gpus-per-task=N to the launcher
 
 # Tar each venv listed here, sbcast to each node's NVMe, auto-rewrite the
 # `_script` activation to use the NVMe path instead of the shared FS.
