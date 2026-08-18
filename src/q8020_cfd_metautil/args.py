@@ -30,7 +30,10 @@ def add_backend_args(parser: argparse.ArgumentParser) -> None:
         parser: ArgumentParser to add arguments to
     """
     parser.add_argument("--backend", type=str, default=None,
-                        help="Fake backend name (e.g., 'manila', 'jakarta')")
+                        help="Fake backend name (e.g., 'manila', 'torino') "
+                             "or path to a noise-bundle JSON produced by "
+                             "q8020-noise-snapshot (sim mode only; detected "
+                             "by the .json suffix)")
     parser.add_argument("--coupling-map", type=str, default="default",
                         choices=["default", "all-to-all"],
                         help="Coupling map: default (backend's native) or all-to-all (full connectivity) (default: default)")
