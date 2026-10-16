@@ -182,15 +182,104 @@ and records overhead timing separately from solver time.
 ```bash
 q8020-sweep sweep_config.toml
 q8020-sweep sweep_config.toml --dry-run
-q8020-sweep sweep_config.toml --groups ideal shots
+q8020-sweep sweep_config.toml ideal shots     # only these groups
+q8020-sweep sweep_config.toml _smoke          # _-prefixed group, by name
 q8020-sweep sweep_config.toml --set _output_dir=/tmp/test
 ```
 
-`--set KEY=VALUE` overrides any `[global]` key before the sweep
-runs.  Repeatable (`--set _output_dir=/tmp --set _slurm=false`).
-Values are coerced to bool/int/float where possible, otherwise kept
-as strings.  Combined with `${VAR}` templates, `--set` lets you
-parameterize a TOML without editing it.
+```
+usage: q8020-sweep [-h] [--dry-run] [--dry-run-materialize]
+                   [--set KEY=VALUE] toml_file [groups ...]
+```
+
+**Where it is installed.**  `q8020-sweep` is a console script of this
+package and is usually not on `PATH`.  Call the copy in this checkout's
+venv, `<checkout>/.venv/bin/q8020-sweep`, by its path.  With an editable
+install it runs whatever branch the checkout is on.  Run the fvm sweeps
+from the checkout's parent directory (the one that holds the solver,
+experiments and metautil repos side by side), because their TOMLs use
+`./`-relative paths.  Example, on one laptop (`<checkout>` =
+`/Users/agallojr/proj/src/q8020/q8020-cfd-metautil`):
+
+```bash
+cd /Users/agallojr/proj/src/q8020
+./q8020-cfd-metautil/.venv/bin/q8020-sweep \
+  q8020-cfd-experiments/aux/fvm_euler_1d_nozzle/fvm_cfl_sweeps.toml \
+  --dry-run --set _postproc_venv=./q8020-cfd-metautil/.venv
+```
+
+**Groups** are positional arguments after the TOML (there is no
+`--groups` flag).  With no group named, every group runs except those
+whose name starts with `_`; a `_`-prefixed group (e.g. `_smoke`) runs
+only when named explicitly.  An unknown group name is an error.
+
+**`--set KEY=VALUE`** overrides or adds a `[global]` key before
+`${VAR}` template expansion.  Repeatable (`--set _output_dir=/tmp
+--set _slurm=false`).  Coercion: `true`/`false` (any case) become bool,
+then int is tried, then float, otherwise the value stays a string.
+An overridden key wins over group-level and per-case values of the same
+key (a list-valued group key still expands to the same number of cases,
+all carrying the override).  Combined with `${VAR}` templates, `--set`
+lets you parameterize a TOML without editing it.
+
+Solver keys and dashes: a bare key (`--set shots=0`) is matched to a
+dashed variant (`"-shots"` / `"--shots"`) only if that variant exists in
+`[global]`.  Otherwise the bare key becomes `--shots`, and the group's
+`"-shots"` is dropped from the command.  In the fvm TOMLs `"-shots"` is
+group-level, so `--set shots=0` renders `--shots 0`, which is wrong for
+a single-dash solver.  For a group-level dashed key, give the dashed
+name in the `=` form (`--set=-shots=0`; `--set -shots=0` is rejected by
+argparse because the value starts with `-`), which renders `-shots 0` in
+every case.
+
+**`--dry-run`** prints every case's solver command and its pre/postproc
+commands (sequential and parallel mode alike; in SLURM mode also the
+venvs it would pack and the `#SBATCH` header) and writes nothing under
+`_output_dir`.  With `_slurm_pack_venvs`, the commands are printed after
+the NVMe venv rewrite (`/mnt/bb/$USER/venv_<i>`), i.e. as the compute
+node runs them and as `--dry-run-materialize` writes them.  The
+`Would launch: ... pipeline_args.json` lines name a file that a plain
+dry run does not write; they are marked as such.  `_env_exports` are
+listed too (`Env export:` lines locally, the sbatch `export` lines
+under SLURM).
+**`--dry-run-materialize`** (implies `--dry-run`)
+additionally writes the run dir, the case dirs with `pipeline_args.json`,
+the `q8020_sweep.sbatch` file (SLURM mode, with NVMe-rewritten commands)
+and `q8020_sweep_invocation.json`, for inspecting what a real launch
+would read; it still never runs the solver, a worker, `sbatch`, or packs
+a venv.  (Behavior change 2026-10-15: before, a parallel or SLURM
+`--dry-run` always wrote case dirs, `pipeline_args.json` and the sbatch
+file.)
+
+**Command-line provenance.**  Every sweep records how it was launched in
+`<run_dir>/q8020_sweep_invocation.json` (written when the run dir is
+created, so it survives a crash) and under the `invocation` key of
+`q8020_sweep_meta<wf_id>.json`.  A multi-stage sweep writes it once,
+in the base run dir, and embeds it once in the combined meta; each
+stage's results carry an `invocation_ref` path instead.  Keys:
+`command_line` (`sys.argv`,
+shell-quoted), `argv`, `python_executable`, `toml_path` (absolute) and
+`toml_path_resolved` (symlinks resolved), `cwd`, `groups`, `overrides`
+(the raw `--set` strings, before coercion), `start_time_utc` (ISO 8601),
+`user` (username, hostname) and `metautil`: `version`, and `commit`,
+`branch`, `dirty` with `commit_source: "git"` only when the running code
+is the checkout itself (an editable install per `direct_url.json`, or
+the module lives under the repo's `src/`).  A copy installed into
+site-packages records `commit: null, commit_source: "installed"`, even
+if its venv sits inside the repo; `"unavailable"` means editable but no
+git.
+
+**`_postproc_venv` check.**  If the TOML sets `_postproc_venv` (the
+venv a `_case_postproc` command activates, e.g. `source
+${_postproc_venv}/bin/activate && ...`) to a directory that does not
+exist, a **real run stops before writing or launching anything**, with
+an error naming the configured path, its absolute form and the remedy
+(`--set _postproc_venv=<path>`).  A **dry run** only warns and shows the
+commands with the running interpreter's environment (`sys.prefix`, the
+venv `q8020-sweep` was started from) so the expansion can still be
+inspected.  The fvm TOMLs set `_postproc_venv = "./.venv"`, a Frontier
+umbrella venv that does not exist on the laptop; there, pass
+`--set _postproc_venv=./q8020-cfd-metautil/.venv` (example above).
 
 ### TOML format
 
@@ -344,8 +433,9 @@ receives a JSON context file as its last argument, containing the
 **SLURM:**
 
 When `_slurm = true`, the sweeper generates an sbatch script and submits
-it automatically.  Use `--dry-run` to generate the script without
-submitting.
+it automatically.  Use `--dry-run` to print the `#SBATCH` header
+without writing or submitting anything, or `--dry-run-materialize` to
+also write the script (and the case dirs) without submitting.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
@@ -431,6 +521,7 @@ syntax substitutes values from completed stages (`run_dir`,
 ```
 <_output_dir>/<date>/<_workflow_id>/
     q8020_sweep_meta<wf_id>.json    # overall sweep metadata
+    q8020_sweep_invocation.json     # command line, cwd, --set, commit
     q8020_expanded_cases.json       # all parameter combinations
     q8020_<config>.toml             # copy of input TOML
     <experiment_id>/                # one per case
@@ -440,6 +531,24 @@ syntax substitutes values from completed stages (`run_dir`,
         q8020_metadata_<exp_id>.json
         ...solver artifacts...
 ```
+
+The sweep meta `timestamp` field is UTC ISO 8601
+(`2026-10-15T03:30:00Z`); before 2026-10-15 it was local time as
+`%Y%m%d_%H%M%S`.
+
+Known issue (not fixed): the sweep meta file name is
+`q8020_sweep_meta{workflow_id}.json` and the workflow id carries a
+leading `_`, so on disk it is `q8020_sweep_meta_<8hex>.json` (e.g.
+`q8020_sweep_meta_52d087d1.json`).  That name matches the fragment-file
+pattern (`FRAGMENT_PATTERN` in `meta_fragment.py`) when the 8-hex id
+happens to be all decimal digits (about 2.3 % of sweeps).  `metakeys` /
+`q8020-harvest` directory walks then treat the run dir as a case dir
+and do not descend into the real case dirs.
+`q8020_sweep_invocation.json` has no id in its name, so it cannot match.
+
+`<date>` is the sweep start date in **UTC** (`yyyy-mm-dd`).  Behavior
+change 2026-10-15: earlier sweeps used the local date, so e.g. the
+Frontier run submitted 2026-04-05T00:10Z landed under `2026-04-04/`.
 
 When `_trials > 1`, trial directories are nested:
 

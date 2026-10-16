@@ -12,9 +12,11 @@ run_single, run_postproc.
 
 #pylint: disable=broad-exception-caught
 
+import importlib.metadata
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -1098,11 +1100,13 @@ def _build_case_launch_info(
     workflow_id: str,
     group_executable: str,
     script_dir: Path,
+    write_files: bool = True,
 ) -> dict[str, Any]:
     """Build launch info for a single case (shared by local and SLURM).
 
     Returns dict with experiment_id, case_dir, cmd, pipeline_args,
-    and the path to the serialized args file.
+    and the path to the serialized args file.  With *write_files* False
+    (plain ``--dry-run``) the case dir and args file are not created.
     """
     experiment_id = generate_experiment_id()
     # Nest trial directories under their parent case directory
@@ -1112,7 +1116,8 @@ def _build_case_launch_info(
         case_dir = run_dir / parent_case_id / f"trial_{trial_index}_{experiment_id}"
     else:
         case_dir = run_dir / experiment_id
-    case_dir.mkdir(parents=True, exist_ok=True)
+    if write_files:
+        case_dir.mkdir(parents=True, exist_ok=True)
 
     # Build solver command (same logic as run_sweep sequential path)
     cmd_args = build_command_args(params)
@@ -1163,8 +1168,9 @@ def _build_case_launch_info(
     }
 
     args_file = case_dir / "pipeline_args.json"
-    with open(args_file, "w", encoding="utf-8") as f:
-        json.dump(pipeline_args, f, indent=2)
+    if write_files:
+        with open(args_file, "w", encoding="utf-8") as f:
+            json.dump(pipeline_args, f, indent=2)
 
     return {
         "experiment_id": experiment_id,
@@ -1173,7 +1179,17 @@ def _build_case_launch_info(
         "cmd": cmd,
         "args_file": args_file,
         "params": params,
+        "case_preproc": case_preproc,
+        "case_postproc": case_postproc,
     }
+
+
+def _unwritten_note(args_file: Path) -> str:
+    """Dry-run suffix for an args file that a plain --dry-run did not
+    write."""
+    if Path(args_file).exists():
+        return ""
+    return f" {DIM}(file written only with --dry-run-materialize){RESET}"
 
 
 def _finalize_slurm_interactive(
@@ -1220,6 +1236,7 @@ def _finalize_slurm_interactive(
             print(
                 f"  {DIM}Would launch:{RESET}"
                 f" {' '.join(srun_cmd)}"
+                f"{_unwritten_note(info['args_file'])}"
             )
         for eid in all_results:
             all_results[eid]["status"] = "dry_run"
@@ -1361,6 +1378,7 @@ def _finalize_local_parallel(
             print(
                 f"  {DIM}Would launch:{RESET}"
                 f" {' '.join(worker_cmd)}"
+                f"{_unwritten_note(info['args_file'])}"
             )
         for eid in all_results:
             all_results[eid]["status"] = "dry_run"
@@ -1841,12 +1859,19 @@ def _collect_parallel_cases(
     workflow_id: str,
     group_executable: str,
     script_dir: Path,
+    dry_run: bool = False,
+    materialize: bool = False,
+    print_cmds: bool = True,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """Prepare cases for parallel launch (local or SLURM).
 
     Returns (results_dict, cases_info_list). The caller
     accumulates cases_info across groups then launches
-    everything at once.
+    everything at once.  On *dry_run* each case's command and
+    pre/postproc lines are printed; case dirs and pipeline_args.json
+    are written only when not a dry run or when *materialize* is set.
+    *print_cmds* False defers the printing to ``_finalize_slurm``, which
+    shows the commands after the NVMe venv rewrite.
     """
     results: dict[str, Any] = {}
     cases_info: list[dict[str, Any]] = []
@@ -1855,6 +1880,7 @@ def _collect_parallel_cases(
         info = _build_case_launch_info(
             case_id, params, run_dir, workflow_id,
             group_executable, script_dir,
+            write_files=(not dry_run) or materialize,
         )
         cases_info.append(info)
         results[info["experiment_id"]] = {
@@ -1865,8 +1891,34 @@ def _collect_parallel_cases(
         }
         print(f"  {DIM}Prepared:{RESET} {case_id}"
               f" ({info['experiment_id']})")
+        if dry_run and print_cmds:
+            _print_dry_run_case(info, script_dir)
 
     return results, cases_info
+
+
+def _print_dry_run_case(
+    info: dict[str, Any], script_dir: Path | None,
+) -> None:
+    """Print a case's solver and pre/postproc commands (dry run; shared
+    by the sequential, parallel and SLURM paths).  *info* needs cmd,
+    experiment_id, case_dir and optionally case_preproc/case_postproc."""
+    cmd = info["cmd"]
+    if cmd[0] == "bash" and cmd[1] == "-c":
+        print(f"    Command: bash -c \"{cmd[2]}\"")
+    else:
+        print(f"    Command: {' '.join(cmd)}")
+    eid = info["experiment_id"]
+    for procs, kind in (
+        (info.get("case_preproc"), "preproc"),
+        (info.get("case_postproc"), "postproc"),
+    ):
+        if procs:
+            pp_json = (
+                Path(info["case_dir"]) / f"q8020_case_{kind}_{eid}.json"
+            )
+            run_postproc(procs, pp_json, script_dir, dry_run=True,
+                         proc_type=kind)
 
 
 def _parse_slurm_job_id(stdout: str) -> str | None:
@@ -1982,6 +2034,28 @@ def _poll_slurm_job(
     )
 
 
+def _nvme_rewrite(
+    parts: list[str], replacements: list[tuple[str, str]],
+) -> list[str]:
+    """Replace venv paths with their NVMe paths in each string of *parts*
+    (*replacements* sorted longest-first)."""
+    out = []
+    for part in parts:
+        for orig, nvme in replacements:
+            part = part.replace(orig, nvme)
+        out.append(part)
+    return out
+
+
+def _slurm_will_rewrite(global_params: dict[str, Any]) -> bool:
+    """True when _finalize_slurm will NVMe-rewrite the case commands."""
+    return bool(
+        global_params.get("_slurm", False)
+        and not global_params.get("_slurm_interactive")
+        and global_params.get("_slurm_pack_venvs")
+    )
+
+
 def _finalize_slurm(
     all_cases_info: list[dict[str, Any]],
     all_results: dict[str, Any],
@@ -1989,18 +2063,23 @@ def _finalize_slurm(
     run_dir: Path,
     dry_run: bool = False,
     dependency_job_id: str | None = None,
+    materialize: bool = False,
 ) -> str | None:
     """Generate and submit one sbatch script for all collected cases,
     mutating *all_results* in place to update status.  *dependency_job_id*
     adds ``--dependency=afterok:<id>``.  Returns the SLURM job ID, or None.
+    A plain *dry_run* writes nothing; with *materialize* it writes the
+    sbatch file and rewritten pipeline_args.json (never tarballs).
     """
+    write_files = (not dry_run) or materialize
     # Auto-pack venvs for NVMe broadcast if requested
     packed_venvs = None
     pack_venvs_list = global_params.get("_slurm_pack_venvs", [])
     if isinstance(pack_venvs_list, str):
         pack_venvs_list = [pack_venvs_list]
     if pack_venvs_list:
-        run_dir.mkdir(parents=True, exist_ok=True)
+        if write_files:
+            run_dir.mkdir(parents=True, exist_ok=True)
         packed_venvs = _pack_venvs(
             pack_venvs_list, run_dir, dry_run,
         )
@@ -2027,6 +2106,22 @@ def _finalize_slurm(
             reverse=True,
         )
 
+        # Dry run: print each case as the compute node will run it
+        # (post-rewrite); _collect_parallel_cases deferred this.
+        if dry_run:
+            print(f"  {DIM}Commands after NVMe venv rewrite:{RESET}")
+            for info in all_cases_info:
+                print(f"  {YELLOW}Case:{RESET} {info['case_id']}"
+                      f" ({info['experiment_id']})")
+                _print_dry_run_case({
+                    **info,
+                    "cmd": _nvme_rewrite(info["cmd"], nvme_replacements),
+                    "case_preproc": _nvme_rewrite(
+                        info.get("case_preproc") or [], nvme_replacements),
+                    "case_postproc": _nvme_rewrite(
+                        info.get("case_postproc") or [], nvme_replacements),
+                }, None)
+
         # Rewrite cmd and postproc in each pipeline_args.json
         for info in all_cases_info:
             args_file = Path(info["args_file"])
@@ -2036,20 +2131,14 @@ def _finalize_slurm(
                 pargs = json.load(f)
             changed = False
             # Rewrite cmd list entries
-            new_cmd = []
-            for part in pargs.get("cmd", []):
-                for orig, nvme in nvme_replacements:
-                    part = part.replace(orig, nvme)
-                new_cmd.append(part)
+            new_cmd = _nvme_rewrite(pargs.get("cmd", []), nvme_replacements)
             if new_cmd != pargs.get("cmd"):
                 pargs["cmd"] = new_cmd
                 changed = True
             # Rewrite case_postproc entries
-            new_pp = []
-            for pp in pargs.get("case_postproc", []):
-                for orig, nvme in nvme_replacements:
-                    pp = pp.replace(orig, nvme)
-                new_pp.append(pp)
+            new_pp = _nvme_rewrite(
+                pargs.get("case_postproc", []), nvme_replacements,
+            )
             if new_pp != pargs.get("case_postproc"):
                 pargs["case_postproc"] = new_pp
                 changed = True
@@ -2065,12 +2154,18 @@ def _finalize_slurm(
         packed_venvs=packed_venvs,
     )
     sbatch_file = run_dir / "q8020_sweep.sbatch"
-    run_dir.mkdir(parents=True, exist_ok=True)
-
-    with open(sbatch_file, "w", encoding="utf-8") as f:
-        f.write(sbatch_content)
-
-    print(f"{CYAN}Generated:{RESET} {sbatch_file}")
+    if write_files:
+        run_dir.mkdir(parents=True, exist_ok=True)
+        with open(sbatch_file, "w", encoding="utf-8") as f:
+            f.write(sbatch_content)
+        print(f"{CYAN}Generated:{RESET} {sbatch_file}")
+    else:
+        print(f"{CYAN}Would generate:{RESET} {sbatch_file}")
+        for line in sbatch_content.splitlines():
+            if line.startswith("#SBATCH"):
+                print(f"  {DIM}{line}{RESET}")
+        for name, value in _get_env_exports(global_params).items():
+            print(f"  {DIM}export {name}=\"{value}\"  (_env_exports){RESET}")
     print(
         f"{DIM}{len(all_cases_info)} cases"
         f" in one job{RESET}"
@@ -2523,31 +2618,166 @@ def run_postproc(
     return results
 
 
-def run_sweep(
-    toml_path: str,
-    script: str | None,
-    arg_mapping: dict | None = None,
-    dry_run: bool = False,
-    group_filter: list | None = None,
-    overrides: dict[str, str] | None = None,
-    *,
-    _preloaded_config: dict | None = None,
-    _dependency_job_id: str | None = None,
-    _run_dir_override: Path | None = None,
-    _workflow_id_override: str | None = None,
-) -> dict:
-    """Run a parameter sweep from a TOML config.  *overrides* are CLI
-    ``--set`` values applied to [global].  The ``_``-prefixed keyword args
-    are internal hooks used by the multi-stage orchestrator (preloaded
-    config, SLURM dependency, run-dir/workflow-id overrides).
-    """
-    config = _preloaded_config or load_sweep_config(toml_path)
-    global_params = config["global"]
+def _metautil_editable() -> bool:
+    """True if the installed q8020-cfd-metautil is an editable install
+    (PEP 610 ``direct_url.json`` with ``dir_info.editable``)."""
+    try:
+        raw = importlib.metadata.distribution(
+            "q8020-cfd-metautil").read_text("direct_url.json")
+    except importlib.metadata.PackageNotFoundError:
+        return False
+    if not raw:
+        return False
+    try:
+        return bool(json.loads(raw).get("dir_info", {}).get("editable"))
+    except (ValueError, AttributeError):
+        return False
 
-    # Apply CLI overrides to global params.  Track the *resolved* keys
-    # (after dashed-variant matching) so the re-merge below can correctly
-    # force them into case params even when the override was given bare
-    # (e.g. --set target=hardware -> resolved key "--target").
+
+def _metautil_provenance() -> dict[str, Any]:
+    """Return the metautil version plus, when this module is the code of a
+    git checkout (editable install, or loaded from the repo's ``src/``),
+    its commit, branch and dirty flag.  A copy installed into
+    site-packages gets ``commit: None, commit_source: "installed"`` even
+    if its venv sits inside the repo."""
+    info: dict[str, Any] = {
+        "version": None, "commit": None, "branch": None, "dirty": None,
+        "commit_source": None,
+    }
+    try:
+        info["version"] = importlib.metadata.version("q8020-cfd-metautil")
+    except importlib.metadata.PackageNotFoundError:
+        pass
+    module_path = Path(__file__).resolve()
+    src_dir = str(module_path.parent)
+    try:
+        head = subprocess.run(
+            ["git", "-C", src_dir, "rev-parse", "--show-toplevel", "HEAD",
+             "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True, timeout=5, check=True,
+        )
+        lines = head.stdout.split("\n")
+        if len(lines) < 3:
+            info["commit_source"] = "unavailable"
+            return info
+        toplevel = Path(lines[0]).resolve()
+        in_src = module_path.is_relative_to(toplevel / "src")
+        if not (in_src or _metautil_editable()):
+            info["commit_source"] = "installed"
+            return info
+        info["commit"], info["branch"] = lines[1], lines[2]
+        status = subprocess.run(
+            ["git", "-C", src_dir, "status", "--porcelain",
+             "--untracked-files=no"],
+            capture_output=True, text=True, timeout=5, check=True,
+        )
+        info["dirty"] = bool(status.stdout.strip())
+        info["commit_source"] = "git"
+    except (OSError, subprocess.SubprocessError):
+        # No git or not a checkout: an installed copy unless editable.
+        if info["commit"] is not None:
+            info["commit_source"] = "git"
+        elif _metautil_editable():
+            info["commit_source"] = "unavailable"
+        else:
+            info["commit_source"] = "installed"
+    return info
+
+
+def make_invocation_record(
+    argv: list[str],
+    toml_path: str,
+    overrides: dict[str, str] | None = None,
+    group_filter: list | None = None,
+    start_time: str | None = None,
+) -> dict[str, Any]:
+    """Describe how the sweep was launched: the full command line, the
+    absolute and symlink-resolved TOML path, cwd, raw (uncoerced) ``--set``
+    overrides, UTC start time and the metautil version/commit."""
+    return {
+        "command_line": shlex.join(argv),
+        "argv": list(argv),
+        "python_executable": sys.executable,
+        "toml_path": str(Path(toml_path).expanduser().absolute()),
+        "toml_path_resolved": str(Path(toml_path).expanduser().resolve()),
+        "cwd": os.getcwd(),
+        "groups": list(group_filter) if group_filter else None,
+        "overrides": dict(overrides or {}),
+        "start_time_utc": start_time or _get_iso_timestamp(),
+        "user": make_user_meta(),
+        "metautil": _metautil_provenance(),
+    }
+
+
+INVOCATION_FILE = "q8020_sweep_invocation.json"
+
+
+def write_invocation_record(run_dir: Path, record: dict[str, Any]) -> Path:
+    """Write *record* to ``<run_dir>/q8020_sweep_invocation.json``.
+
+    No workflow id in the name: ``q8020_<name>_<digits>.json`` matches
+    FRAGMENT_PATTERN and would make the run dir look like a case dir.
+    """
+    run_dir.mkdir(parents=True, exist_ok=True)
+    path = run_dir / INVOCATION_FILE
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(record, f, indent=2)
+    return path
+
+
+def _fallback_postproc_venv(
+    global_params: dict[str, Any], dry_run: bool,
+) -> None:
+    """Check that ``_postproc_venv`` (if set) is an existing directory.
+
+    On a real run a missing venv (e.g. the Frontier umbrella ``./.venv``
+    on a laptop, or a wrong cwd) raises ValueError, so nothing launches
+    with a postproc that cannot activate.  On a dry run, warn and display
+    the commands with the running interpreter's environment
+    (``sys.prefix``) instead.  Mutates *global_params*; must run before
+    template expansion.
+    """
+    raw = global_params.get("_postproc_venv")
+    if not isinstance(raw, str) or not raw:
+        return
+    configured = _expand_templates_fixpoint(raw, global_params)
+    if Path(configured).expanduser().is_dir():
+        return
+    abs_path = Path(configured).expanduser().absolute()
+    if not dry_run:
+        raise ValueError(
+            f"_postproc_venv {configured} ({abs_path}) does not exist."
+            f" Run from the directory the TOML's relative paths assume,"
+            f" or pass --set _postproc_venv=<path to the postproc venv>"
+            f" (e.g. --set _postproc_venv=./q8020-cfd-metautil/.venv)."
+        )
+    fallback = Path(sys.prefix)
+    if not (fallback / "bin" / "activate").exists():
+        print(
+            f"{YELLOW}Warning: _postproc_venv {configured}"
+            f" ({abs_path}) does not exist and the running"
+            f" interpreter's prefix {fallback} is not a venv; leaving it"
+            f" unchanged (a real run would stop here).{RESET}",
+            file=sys.stderr,
+        )
+        return
+    print(
+        f"{YELLOW}Warning: _postproc_venv {configured}"
+        f" ({abs_path}) does not exist; dry run shows the running"
+        f" interpreter's environment {fallback} instead (a real run"
+        f" would stop with an error){RESET}",
+        file=sys.stderr,
+    )
+    global_params["_postproc_venv"] = str(fallback)
+
+
+def _apply_overrides(
+    global_params: dict[str, Any],
+    overrides: dict[str, str] | None,
+) -> set[str]:
+    """Apply CLI ``--set`` *overrides* to *global_params* in place, with
+    bool/int/float coercion, and return the resolved keys (after
+    dashed-variant matching, e.g. ``target`` -> ``--target``)."""
     resolved_override_keys: set[str] = set()
     if overrides:
         for key, value in overrides.items():
@@ -2578,6 +2808,44 @@ def run_sweep(
                         global_params[target_key] = float(value)
                     except ValueError:
                         global_params[target_key] = value
+
+    return resolved_override_keys
+
+
+def run_sweep(
+    toml_path: str,
+    script: str | None,
+    arg_mapping: dict | None = None,
+    dry_run: bool = False,
+    group_filter: list | None = None,
+    overrides: dict[str, str] | None = None,
+    *,
+    dry_run_materialize: bool = False,
+    invocation: dict[str, Any] | None = None,
+    _preloaded_config: dict | None = None,
+    _dependency_job_id: str | None = None,
+    _run_dir_override: Path | None = None,
+    _workflow_id_override: str | None = None,
+) -> dict:
+    """Run a parameter sweep from a TOML config.  *overrides* are CLI
+    ``--set`` values applied to [global].  *dry_run_materialize* makes a
+    parallel/SLURM dry run write case dirs, pipeline_args.json, the sbatch
+    file and the invocation record (a plain dry run writes nothing).
+    *invocation* is the launch record from ``make_invocation_record``
+    (built from ``sys.argv`` when None).  The ``_``-prefixed keyword args
+    are internal hooks used by the multi-stage orchestrator (preloaded
+    config, SLURM dependency, run-dir/workflow-id overrides).
+    """
+    config = _preloaded_config or load_sweep_config(toml_path)
+    global_params = config["global"]
+
+    # Apply CLI overrides to global params.  Track the *resolved* keys
+    # (after dashed-variant matching) so the re-merge below can correctly
+    # force them into case params even when the override was given bare
+    # (e.g. --set target=hardware -> resolved key "--target").
+    resolved_override_keys = _apply_overrides(global_params, overrides)
+
+    _fallback_postproc_venv(global_params, dry_run)
 
     # Expand ${VAR} templates throughout the config using global params.
     # Fixpoint expansion: values may reference other ${VAR}s that themselves
@@ -2665,8 +2933,8 @@ def run_sweep(
     # symlinks to /autofs/... which may not be visible on compute nodes.
     output_dir = Path(output_dir_str).expanduser().absolute()
 
-    # Create date directory (yyyy-mm-dd) under output_dir
-    date_str = datetime.now().strftime("%Y-%m-%d")
+    # Create date directory (yyyy-mm-dd, UTC) under output_dir
+    date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     date_dir = output_dir / date_str
 
     # Create output_dir and date_dir if they don't exist
@@ -2687,6 +2955,17 @@ def run_sweep(
     # Record sweep start time
     sweep_start_time = _get_iso_timestamp()
 
+    # A multi-stage stage (_run_dir_override) does not record the
+    # invocation itself; the orchestrator writes it once in the base dir.
+    is_stage = _run_dir_override is not None
+    if invocation is None and not is_stage:
+        invocation = make_invocation_record(
+            sys.argv, toml_path, overrides, group_filter,
+            start_time=sweep_start_time,
+        )
+    if not is_stage and (not dry_run or dry_run_materialize):
+        write_invocation_record(run_dir, invocation)
+
     if not dry_run:
         run_dir.mkdir(parents=True, exist_ok=True)
         # Copy input TOML to run directory with q8020_ prefix
@@ -2700,7 +2979,7 @@ def run_sweep(
         with open(expanded_cases_file, "w", encoding="utf-8") as f:
             json.dump({"cases": all_cases, "global": global_params}, f, indent=2)
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     # Capture library versions once for the entire sweep
     library_versions = make_library_meta()
@@ -2716,6 +2995,10 @@ def run_sweep(
         "groups": {},
         "cases": {},
     }
+    if is_stage:
+        results["invocation_ref"] = str(run_dir.parent / INVOCATION_FILE)
+    else:
+        results["invocation"] = invocation
     
     all_case_dirs: list[Path] = []
 
@@ -2735,6 +3018,13 @@ def run_sweep(
         f" [{mode_label}]"
     )
     print(f"{CYAN}{BOLD}Output directory:{RESET} {run_dir}")
+    if dry_run and not is_stage:
+        print(f"{CYAN}{BOLD}Invocation:{RESET} {invocation['command_line']}")
+    if dry_run and (
+        not use_slurm or global_params.get("_slurm_interactive")
+    ):
+        for name, value in _get_env_exports(global_params).items():
+            print(f"{CYAN}{BOLD}Env export:{RESET} {name}={value}")
     print()
 
     # For parallel modes, accumulate cases across groups
@@ -2808,6 +3098,10 @@ def run_sweep(
                 _collect_parallel_cases(
                     expanded_cases, run_dir, workflow_id,
                     group_executable, script_dir,
+                    dry_run=dry_run, materialize=dry_run_materialize,
+                    print_cmds=not (
+                        use_slurm and _slurm_will_rewrite(global_params)
+                    ),
                 )
             )
             parallel_all_cases_info.extend(group_cases_info)
@@ -2925,49 +3219,24 @@ def run_sweep(
                 cmd = cmd_parts + cmd_args
 
             if dry_run:
-                if cmd[0] == "bash" and cmd[1] == "-c":
-                    print(
-                        f"    Command: bash -c \"{cmd[2]}\""
-                    )
-                else:
-                    print(
-                        f"    Command: {' '.join(cmd)}"
-                    )
                 results["cases"][experiment_id] = {
                     "command": cmd, "status": "dry_run",
                 }
-
-                case_preproc = params.get(
-                    "_case_preproc", []
-                )
-                if case_preproc:
-                    if isinstance(case_preproc, str):
-                        case_preproc = [case_preproc]
-                    pp_json = (
-                        case_dir
-                        / f"q8020_case_preproc_"
-                        f"{experiment_id}.json"
-                    )
-                    run_postproc(
-                        case_preproc, pp_json,
-                        script_dir, dry_run,
-                    )
-
-                case_postproc = params.get(
-                    "_case_postproc", []
-                )
-                if case_postproc:
-                    if isinstance(case_postproc, str):
-                        case_postproc = [case_postproc]
-                    pp_json = (
-                        case_dir
-                        / f"q8020_case_postproc_"
-                        f"{experiment_id}.json"
-                    )
-                    run_postproc(
-                        case_postproc, pp_json,
-                        script_dir, dry_run,
-                    )
+                case_preproc = params.get("_case_preproc", [])
+                case_postproc = params.get("_case_postproc", [])
+                _print_dry_run_case({
+                    "cmd": cmd,
+                    "experiment_id": experiment_id,
+                    "case_dir": case_dir,
+                    "case_preproc": (
+                        [case_preproc] if isinstance(case_preproc, str)
+                        else case_preproc
+                    ),
+                    "case_postproc": (
+                        [case_postproc] if isinstance(case_postproc, str)
+                        else case_postproc
+                    ),
+                }, script_dir)
                 continue
 
             # Run per-case preproc if specified
@@ -3186,6 +3455,7 @@ def run_sweep(
                 parallel_all_results,
                 global_params, run_dir, dry_run,
                 dependency_job_id=_dependency_job_id,
+                materialize=dry_run_materialize,
             )
         else:
             _finalize_local_parallel(
@@ -3306,6 +3576,8 @@ def _run_multi_stage_sweep(
     dry_run: bool = False,
     group_filter: list | None = None,
     overrides: dict[str, str] | None = None,
+    dry_run_materialize: bool = False,
+    invocation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run a multi-stage sweep where each stage executes after the previous.
 
@@ -3314,13 +3586,28 @@ def _run_multi_stage_sweep(
     ``ValueError`` (the local process cannot block on a queued job).
     Returns a combined results dict with per-stage sub-results.
     """
-    # Shared workflow ID and base run directory for all stages
+    # Shared workflow ID and base run directory for all stages.  Apply
+    # --set to a copy of the outer [global] so the base run dir honors
+    # e.g. --set _output_dir (each stage's run_sweep applies them again).
+    outer_global = dict(outer_global)
+    _apply_overrides(outer_global, overrides)
     workflow_id = generate_workflow_id()
-    output_dir_str = outer_global.get("_output_dir", "./sweep_results")
+    output_dir_str = str(_expand_templates_fixpoint(
+        outer_global.get("_output_dir", "./sweep_results"), outer_global,
+    ))
     output_dir = Path(output_dir_str).expanduser().absolute()
-    date_str = datetime.now().strftime("%Y-%m-%d")
+    date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     date_dir = output_dir / date_str
     base_run_dir = date_dir / workflow_id
+
+    start_time = _get_iso_timestamp()
+    if invocation is None:
+        invocation = make_invocation_record(
+            sys.argv, toml_path, overrides, group_filter,
+            start_time=start_time,
+        )
+    if not dry_run or dry_run_materialize:
+        write_invocation_record(base_run_dir, invocation)
 
     if not dry_run:
         base_run_dir.mkdir(parents=True, exist_ok=True)
@@ -3333,6 +3620,8 @@ def _run_multi_stage_sweep(
         f" {len(stages)} stages"
     )
     print(f"{CYAN}{BOLD}Output directory:{RESET} {base_run_dir}")
+    if dry_run:
+        print(f"{CYAN}{BOLD}Invocation:{RESET} {invocation['command_line']}")
     for i, (sname, _, sgroups) in enumerate(stages, 1):
         n = sum(len(g["expanded_cases"]) for g in sgroups.values())
         print(f"  Stage {i}: {sname} ({n} cases)")
@@ -3344,7 +3633,8 @@ def _run_multi_stage_sweep(
         "output_dir": str(output_dir),
         "workflow_id": workflow_id,
         "run_dir": str(base_run_dir),
-        "start_time": _get_iso_timestamp(),
+        "start_time": start_time,
+        "invocation": invocation,
         "stages": {},
     }
     prev_job_id: str | None = None
@@ -3395,6 +3685,7 @@ def _run_multi_stage_sweep(
             dry_run=dry_run,
             group_filter=group_filter,
             overrides=overrides,
+            dry_run_materialize=dry_run_materialize,
             _preloaded_config=stage_config,
             _dependency_job_id=prev_job_id,
             _run_dir_override=stage_run_dir,
@@ -3452,15 +3743,23 @@ Usage:
     q8020-sweep config.toml --dry-run
     q8020-sweep config.toml h2_sweep          # run only h2_sweep group
     q8020-sweep config.toml h2_sweep li_sweep # run multiple groups
+    q8020-sweep config.toml _smoke            # _-prefixed: only when named
 """)
     parser.add_argument("toml_file", help="Path to TOML configuration file")
     parser.add_argument(
         "groups", nargs="*", default=None,
-        help="Optional group name(s) to run. If omitted, runs all groups."
+        help="Optional group name(s) to run. If omitted, runs all groups"
+        " except those whose name starts with '_'."
     )
     parser.add_argument(
         "--dry-run", action="store_true",
-        help="Print commands without executing"
+        help="Print commands without executing; writes nothing"
+    )
+    parser.add_argument(
+        "--dry-run-materialize", action="store_true",
+        help="Dry run that also writes the run dir, case dirs, "
+        "pipeline_args.json, sbatch file and invocation record "
+        "(implies --dry-run)"
     )
     parser.add_argument(
         "--set", action="append", default=[],
@@ -3470,6 +3769,8 @@ Usage:
     )
 
     args = parser.parse_args()
+    if args.dry_run_materialize:
+        args.dry_run = True
 
     # Parse --set overrides into a dict
     overrides: dict[str, str] = {}
@@ -3486,6 +3787,9 @@ Usage:
 
     # Convert empty list to None for group_filter
     group_filter = args.groups if args.groups else None
+    invocation = make_invocation_record(
+        sys.argv, args.toml_file, overrides, group_filter,
+    )
 
     try:
         # Load config to check for multi-stage
@@ -3506,6 +3810,8 @@ Usage:
                 dry_run=args.dry_run,
                 group_filter=group_filter,
                 overrides=overrides,
+                dry_run_materialize=args.dry_run_materialize,
+                invocation=invocation,
             )
 
             # Print multi-stage summary
@@ -3542,6 +3848,8 @@ Usage:
                 dry_run=args.dry_run,
                 group_filter=group_filter,
                 overrides=overrides,
+                dry_run_materialize=args.dry_run_materialize,
+                invocation=invocation,
             )
 
             # Print summary

@@ -1,9 +1,10 @@
 """Integration tests for the synthesized srun launcher, the per-group
 _script override (merge fix), and _env_exports propagation.
 
-Driven through ``run_sweep(dry_run=True)``: even in dry-run the sweeper
-writes per-case ``pipeline_args.json`` (solver cmd) and, for Slurm mode,
-the generated sbatch — enough to assert on without submitting anything.
+Driven through ``run_sweep(dry_run=True, dry_run_materialize=True)``: a
+materialized dry run writes per-case ``pipeline_args.json`` (solver cmd)
+and, for Slurm mode, the generated sbatch — enough to assert on without
+submitting anything (a plain dry run writes nothing).
 """
 
 import json
@@ -11,6 +12,10 @@ import sys
 from pathlib import Path
 
 from q8020_cfd_metautil.sweep import run_sweep
+
+
+# Dry run that still writes pipeline_args.json / sbatch for inspection.
+_MATERIALIZE = {"dry_run": True, "dry_run_materialize": True}
 
 
 def _write_toml(tmp_path: Path, body: str) -> Path:
@@ -54,7 +59,7 @@ qubits = 32
 
 def test_launcher_synthesized_for_multirank_slurm(tmp_path):
     toml = _write_toml(tmp_path, _slurm_global(tmp_path))
-    results = run_sweep(str(toml), None, dry_run=True)
+    results = run_sweep(str(toml), None, **_MATERIALIZE)
     (cmd,) = _pipeline_cmds(results).values()
     assert cmd[0] == "srun"
     joined = " ".join(cmd)
@@ -79,7 +84,7 @@ _script = "srun -n 16 python solver.py"
 [g1]
 qubits = 32
 """)
-    results = run_sweep(str(toml), None, dry_run=True)
+    results = run_sweep(str(toml), None, **_MATERIALIZE)
     (cmd,) = _pipeline_cmds(results).values()
     # Exactly the user's srun, not a doubled one
     assert cmd[0] == "srun"
@@ -100,7 +105,7 @@ _script = "/opt/mysrun-env/bin/python solver.py"
 [g1]
 qubits = 32
 """)
-    results = run_sweep(str(toml), None, dry_run=True)
+    results = run_sweep(str(toml), None, **_MATERIALIZE)
     (cmd,) = _pipeline_cmds(results).values()
     assert cmd[0] == "srun"
 
@@ -109,7 +114,7 @@ def test_launcher_none_suppresses_synthesis(tmp_path):
     toml = _write_toml(
         tmp_path, _slurm_global(tmp_path, '_slurm_launcher = "none"'),
     )
-    results = run_sweep(str(toml), None, dry_run=True)
+    results = run_sweep(str(toml), None, **_MATERIALIZE)
     (cmd,) = _pipeline_cmds(results).values()
     assert "srun" not in cmd
 
@@ -126,7 +131,7 @@ _script = "python solver.py"
 [g1]
 qubits = 32
 """)
-    results = run_sweep(str(toml), None, dry_run=True)
+    results = run_sweep(str(toml), None, **_MATERIALIZE)
     (cmd,) = _pipeline_cmds(results).values()
     assert "srun" not in cmd
 
@@ -142,7 +147,7 @@ _script = "python solver.py"
 [g1]
 qubits = 32
 """)
-    results = run_sweep(str(toml), None, dry_run=True)
+    results = run_sweep(str(toml), None, **_MATERIALIZE)
     (cmd,) = _pipeline_cmds(results).values()
     assert "srun" not in cmd
 
@@ -154,7 +159,7 @@ def test_launcher_composes_with_env_activation(tmp_path):
     toml = _write_toml(
         tmp_path, _slurm_global(tmp_path, f'_env = "{venv}"'),
     )
-    results = run_sweep(str(toml), None, dry_run=True)
+    results = run_sweep(str(toml), None, **_MATERIALIZE)
     (cmd,) = _pipeline_cmds(results).values()
     assert cmd[:2] == ["bash", "-c"]
     assert "activate && srun -N 2 -n 16" in cmd[2]
@@ -178,7 +183,7 @@ qubits = 32
 _script = "python group_solver.py"
 qubits = 32
 """)
-    results = run_sweep(str(toml), None, dry_run=True)
+    results = run_sweep(str(toml), None, **_MATERIALIZE)
     cmds = _pipeline_cmds(results)
     assert "global_solver.py" in cmds["g1"]
     assert "group_solver.py" in cmds["g2"]
@@ -196,7 +201,7 @@ _script = "python group_solver.py"
 qubits = 32
 """)
     results = run_sweep(
-        str(toml), None, dry_run=True,
+        str(toml), None, **_MATERIALIZE,
         overrides={"_script": "python override_solver.py"},
     )
     (cmd,) = _pipeline_cmds(results).values()
@@ -219,7 +224,7 @@ _script = "${{_launch}} python solver.py"
 [g1]
 qubits = 32
 """)
-    results = run_sweep(str(toml), None, dry_run=True)
+    results = run_sweep(str(toml), None, **_MATERIALIZE)
     (cmd,) = _pipeline_cmds(results).values()
     assert cmd[:3] == ["custom_tool", "-n", "4"]
 
