@@ -34,6 +34,7 @@ import tomllib
 
 import subprocess_tee
 
+from q8020_cfd_metautil import code_provenance
 from q8020_cfd_metautil.harvest import harvest_metadata
 from q8020_cfd_metautil.meta_fragment import (
     generate_experiment_id,
@@ -415,8 +416,10 @@ def _make_code_section(
     env_before: dict[str, Any] | None = None,
     env_after: dict[str, Any] | None = None,
     case_params: dict[str, Any] | None = None,
+    code_provenance_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Build code metadata section with optional library version snapshots."""
+    """Build code metadata section with optional library version snapshots
+    and the sweep's solver-code provenance (commit or content hash)."""
     interpreter, entry_point, algorithm = _resolve_app_identity(
         command, case_params
     )
@@ -432,7 +435,45 @@ def _make_code_section(
         result["library_versions_before"] = env_before
     if env_after is not None:
         result["library_versions_after"] = env_after
+    if code_provenance_summary is not None:
+        result["code_provenance"] = code_provenance_summary
     return result
+
+
+def _print_code_provenance(record: dict[str, Any]) -> None:
+    """One-line summary of the captured solver-code provenance."""
+    if record.get("error"):
+        print(f"  {YELLOW}Code provenance: {record['error']}{RESET}")
+    elif record.get("kind") == "git":
+        git = record["git"]
+        state = " (dirty, patch saved)" if git.get("dirty") else ""
+        if git.get("untracked_archive"):
+            state += " (+untracked files archived)"
+        print(f"  {DIM}Code provenance:{RESET} git {git['commit'][:12]}"
+              f"{state} {record['code_dir']}")
+    elif record.get("kind") == "directory":
+        print(f"  {DIM}Code provenance:{RESET} not a git checkout; content "
+              f"sha256 {record['content_sha256'][:12]}, archive "
+              f"{record.get('archive')} {record['code_dir']}")
+
+
+def _snapshot_env(env_path: str | None, command: list[str]) -> dict[str, Any]:
+    """Snapshot the solver's packages: *env_path* (``_env``) if set, else the
+    venv the command activates, else this (the sweeper's) process."""
+    inferred = None
+    if not env_path:
+        inferred = code_provenance.infer_env_from_command(command)
+    target = env_path or inferred
+    if target:
+        snapshot = capture_lib_snapshot(target)
+        if inferred:
+            snapshot["inferred_from"] = "command"
+        return snapshot
+    return {
+        "type": "current_process",
+        "packages": make_library_meta(),
+        "timestamp": _get_iso_timestamp(),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -605,15 +646,7 @@ def run_single(
 
     # Capture environment snapshot before execution
     # Always capture library versions for reproducibility
-    if env_path:
-        env_before = capture_lib_snapshot(env_path)
-    else:
-        # No explicit env_path - capture from current process environment
-        env_before = {
-            "type": "current_process",
-            "packages": make_library_meta(),
-            "timestamp": _get_iso_timestamp(),
-        }
+    env_before = _snapshot_env(env_path, command)
     env_before_file = (
         case_dir / f"q8020_env_before_{experiment_id}.json"
     )
@@ -791,15 +824,7 @@ def run_single(
 
     # Capture environment snapshot after execution
     # Always capture library versions for reproducibility
-    if env_path:
-        env_after = capture_lib_snapshot(env_path)
-    else:
-        # No explicit env_path - capture from current process environment
-        env_after = {
-            "type": "current_process",
-            "packages": make_library_meta(),
-            "timestamp": _get_iso_timestamp(),
-        }
+    env_after = _snapshot_env(env_path, command)
     env_after_file = (
         case_dir / f"q8020_env_after_{experiment_id}.json"
     )
@@ -812,6 +837,7 @@ def run_single(
         env_before=env_before,
         env_after=env_after,
         case_params=case_params,
+        code_provenance_summary=code_provenance.load_for_case(case_dir),
     )
     write_code(
         case_dir, code_section,
@@ -889,14 +915,7 @@ def run_case_pipeline(
 
     # env snapshot before
     t_pre_start = time.perf_counter()
-    if env_path:
-        env_before = capture_lib_snapshot(env_path)
-    else:
-        env_before = {
-            "type": "current_process",
-            "packages": make_library_meta(),
-            "timestamp": _get_iso_timestamp(),
-        }
+    env_before = _snapshot_env(env_path, cmd)
     env_before_file = (
         case_dir / f"q8020_env_before_{experiment_id}.json"
     )
@@ -1018,14 +1037,7 @@ def run_case_pipeline(
 
     # env snapshot after
     t_post_start = time.perf_counter()
-    if env_path:
-        env_after = capture_lib_snapshot(env_path)
-    else:
-        env_after = {
-            "type": "current_process",
-            "packages": make_library_meta(),
-            "timestamp": _get_iso_timestamp(),
-        }
+    env_after = _snapshot_env(env_path, cmd)
     env_after_file = (
         case_dir / f"q8020_env_after_{experiment_id}.json"
     )
@@ -1037,6 +1049,7 @@ def run_case_pipeline(
         env_before=env_before,
         env_after=env_after,
         case_params=case_params,
+        code_provenance_summary=code_provenance.load_for_case(case_dir),
     )
     write_code(
         case_dir, code_section,
@@ -2978,6 +2991,13 @@ def run_sweep(
             all_cases.update(group["expanded_cases"])
         with open(expanded_cases_file, "w", encoding="utf-8") as f:
             json.dump({"cases": all_cases, "global": global_params}, f, indent=2)
+        # Which solver code this sweep runs: commit (+ patch if dirty) for a
+        # git checkout, else a content hash and one source archive per sweep.
+        # Captured at launch, so SLURM jobs record the code as submitted.
+        provenance = code_provenance.capture_code_provenance(
+            script_dir, run_dir, exclude=[output_dir],
+        )
+        _print_code_provenance(provenance)
 
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 

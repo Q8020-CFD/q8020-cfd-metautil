@@ -522,6 +522,8 @@ syntax substitutes values from completed stages (`run_dir`,
 <_output_dir>/<date>/<_workflow_id>/
     q8020_sweep_meta<wf_id>.json    # overall sweep metadata
     q8020_sweep_invocation.json     # command line, cwd, --set, commit
+    q8020_code_provenance.json      # which solver code ran (see below)
+    code/                           # only when needed: patch / source archive
     q8020_expanded_cases.json       # all parameter combinations
     q8020_<config>.toml             # copy of input TOML
     <experiment_id>/                # one per case
@@ -558,6 +560,41 @@ When `_trials > 1`, trial directories are nested:
     trial_1_<trial_exp_id>/
     ...
 ```
+
+#### Solver code provenance
+
+Once per sweep (at launch, so a SLURM sweep records the code as
+submitted), the sweeper identifies the solver code dir (the directory of
+the `.py` file in `_script`) and writes `q8020_code_provenance.json`:
+
+- **git checkout** (worktrees included): commit, branch, `describe`,
+  remote URL with any `user:token@` stripped, and dirty state.  A clean
+  tree stores nothing else.  A dirty tree also saves its tracked diff as
+  `code/<commit>-<hash>.patch` and its untracked files as
+  `code/untracked-<hash>.tar.gz`.  The commit is always recorded; only
+  these extras are capped: a diff over 20 MB is hashed but not saved,
+  more than 5000 untracked files are counted but not hashed, and over
+  100 MB of untracked files are hashed but not archived.  The record
+  keeps the untracked count and the first 50 names.
+- **not a git checkout** (e.g. a Docker image built without `.git`): a
+  sha256 over the sorted source files (`.venv`, `__pycache__`, `.git`,
+  `output/`, `build/` and similar skipped; files over 5 MB listed, not
+  hashed) and one `code/<hash>.tar.gz` source archive for the whole
+  sweep (skipped above 100 MB of source).  Same code gives the same hash.
+- either way, sha256 of `uv.lock`, `pyproject.toml`, `requirements*.txt`
+  and similar dependency files.
+
+Each case's `q8020_sweep_code_<exp_id>_0.json` (and so the `code`
+section of its merged metadata) carries a compact `code_provenance`
+reference (commit or content hash, patch/archive paths, dependency file
+hashes), not a copy of the archive.  Provenance problems are recorded in
+an `error` field and never fail the sweep.
+
+`q8020_env_before/after_<exp_id>.json` snapshot the solver's packages:
+`_env` if set, otherwise the venv the command activates
+(`source <venv>/bin/activate`, marked `"inferred_from": "command"`),
+otherwise the sweeper's own process.  Before 2026-10-28 a sweep without
+`_env` always recorded the sweeper's process, not the solver's venv.
 
 ## Solver framework (solverfw)
 
